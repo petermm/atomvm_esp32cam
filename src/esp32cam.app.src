@@ -1,12 +1,12 @@
 {application, esp32cam, [
-    {description, "An OTP library"},
+    {description, "AtomVM ESP32 camera driver"},
     {vsn, "0.1.0"},
     {registered, []},
     {applications, [
         kernel, stdlib
     ]},
-    {env,[]},
+    {env, []},
     {modules, []},
-    {licenses, ["Apache 2.0"]},
-    {links, []}
- ]}.
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/atomvm/atomvm_esp32cam"}]}
+]}.

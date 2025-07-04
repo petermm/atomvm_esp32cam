@@ -1,0 +1,15 @@
+{
+  "name": "AtomVM ESP32 Camera",
+  "version": "latest",
+  "new_install_improv_wait_time": 0,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [{ "path": "AtomVM-esp32cam-esp32-latest.img", "offset": 4096 }]
+    },
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [{ "path": "AtomVM-esp32cam-esp32s3-latest.img", "offset": 0 }]
+    }
+  ]
+}
