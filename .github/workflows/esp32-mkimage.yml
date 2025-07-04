@@ -1,0 +1,321 @@
+#
+#  Copyright 2022 Fred Dushin <fred@dushin.net>
+#
+#  SPDX-License-Identifier: Apache-2.0 OR LGPL-2.1-or-later
+#
+
+name: esp32-mkimage
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref != 'refs/heads/master' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release:
+    name: "Build and release"
+    runs-on: ubuntu-latest
+    container: espressif/idf:v${{ matrix.idf-version }}
+    strategy:
+      matrix:
+        idf-version: ["5.5.3"]
+        cc: ["clang-19"]
+        cxx: ["clang++-19"]
+        cflags: ["-O3"]
+        otp: ["29"]
+        elixir_version: ["1.20"]
+        compiler_pkgs: ["clang-19"]
+        soc: ["esp32", "esp32s3"]
+        flavor: ["", "-elixir"]
+        atomvm_versions: ["main"]
+
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      CFLAGS: ${{ matrix.cflags }}
+      CXXFLAGS: ${{ matrix.cflags }}
+      ImageOS: "ubuntu24"
+      ELIXIR_ERL_OPTIONS: "+fnu"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          elixir-version: ${{ matrix.elixir_version }}
+          rebar3-version: "3.27.0"
+          hexpm-mirrors: |
+            https://builds.hex.pm
+            https://repo.hex.pm
+            https://cdn.jsdelivr.net/hex
+
+      - name: "Install dependencies"
+        run: |
+          apt update -y
+          DEBIAN_FRONTEND=noninteractive apt install -y ${{ matrix.compiler_pkgs}} git cmake gperf zlib1g-dev ninja-build
+
+      # needed for generating AtomVM version when running in a docker container
+      - name: "Configure Git"
+        run: |
+          git config --global --add safe.directory /__w/atomvm_esp32cam/atomvm_esp32cam
+          echo -n "git rev-parse: "
+          git rev-parse --short HEAD
+
+      # Builder info
+      - name: "System info"
+        run: |
+          echo "**uname:**"
+          uname -a
+          echo "**libc version:**"
+          ldd --version
+          echo "**C Compiler version:**"
+          $CC --version
+          $CXX --version
+          echo "**Linker version:**"
+          ld --version
+          echo "**CMake version:**"
+          cmake --version
+          echo "**OTP version:**"
+          cat $(dirname $(which erlc))/../releases/RELEASES || true
+
+      - name: "Clone AtomVM"
+        run: |
+          git clone https://github.com/atomvm/AtomVM --branch ${{matrix.atomvm_versions}} --single-branch
+
+      - name: "Link/copy component into AtomVM"
+        run: |
+          mkdir -p ./AtomVM/src/platforms/esp32/components/atomvm_esp32cam
+          cp -r CMakeLists.txt Kconfig idf_component.yml nifs src ./AtomVM/src/platforms/esp32/components/atomvm_esp32cam/
+
+      - name: "Build: create build dir"
+        working-directory: ./AtomVM
+        run: mkdir build
+
+      - name: "Build: run cmake"
+        working-directory: ./AtomVM/build
+        shell: bash
+        run: |
+          if [ "${{ matrix.flavor }}" = "-elixir" ]; then
+            cmake -G Ninja -DAVM_RELEASE=ON ..
+          else
+            cmake -G Ninja ..
+          fi
+          # git clone will use more recent timestamps than cached beam files
+          # touch them so we can benefit from the cache and avoid costly beam file rebuild.
+          find . -name '*.beam' -exec touch {} \;
+
+      - name: "Build erlang and Elixir libs"
+        working-directory: ./AtomVM/build
+        run: |
+          LANG=en_US.UTF-8 ninja
+
+      - name: "Build the esp32cam firmware"
+        run: |
+          rebar3 compile
+          mkdir -p examples/esp32cam_example/_checkouts
+          ln -sf ../../../ examples/esp32cam_example/_checkouts/esp32cam
+          cd examples/esp32cam_example
+          rebar3 compile
+          rebar3 atomvm packbeam
+
+      # - name: "Use release defaults"
+      #   if: startsWith(github.ref, 'refs/tags/')
+      #   shell: bash
+      #   working-directory: ./AtomVM/src/platforms/esp32/
+      #   run: |
+      #     cp sdkconfig.release-defaults sdkconfig.defaults
+
+      - name: "Apply esp32cam sdkconfig defaults"
+        shell: bash
+        run: |
+          if [ -f ./AtomVM/src/platforms/esp32/sdkconfig.defaults.in ]; then
+            cat sdkconfig.defaults.esp32cam >> ./AtomVM/src/platforms/esp32/sdkconfig.defaults.in
+          fi
+
+      # - name: "Clone required components"
+      #   shell: bash
+      #   working-directory: ./AtomVM/src/platforms/esp32/components/
+      #   run: |
+      #     git clone https://github.com/atomvm/atomvm_neopixel
+      #     git clone https://github.com/atomvm/atomvm_mqtt_client
+
+      - name: "Copy mkimage.config.in template"
+        shell: bash
+        run: |
+          cp ./installer/mkimage.config.in ./AtomVM/src/platforms/esp32/tools/
+
+      - name: "Build ${{ matrix.soc }}${{ matrix.flavor }} with idf.py"
+        shell: bash
+        working-directory: ./AtomVM/src/platforms/esp32/
+        run: |
+          rm -rf build
+          . $IDF_PATH/export.sh
+          if [ "${{ matrix.flavor }}" = "-elixir" ]
+          then
+            idf.py -DATOMVM_ELIXIR_SUPPORT=on set-target ${{ matrix.soc }}
+          else
+            idf.py -DATOMVM_ELIXIR_SUPPORT=off set-target ${{ matrix.soc }}
+          fi
+          idf.py build
+
+      - name: "Stage esp32cam example packbeam for mkimage"
+        shell: bash
+        run: |
+          cp examples/esp32cam_example/_build/default/lib/esp32cam_example.avm \
+            ./AtomVM/src/platforms/esp32/build/esp32cam_example.avm
+
+      - name: "Create a ${{ matrix.soc }}${{ matrix.flavor }} image"
+        working-directory: ./AtomVM/src/platforms/esp32/build
+        run: |
+          ./mkimage.sh
+          ls -l *.img
+
+      - name: "Upload ${{ matrix.soc }}${{ matrix.flavor }} artifacts"
+        uses: actions/upload-artifact@v4
+        with:
+          name: atomvm-esp32cam-${{ matrix.soc }}${{ matrix.flavor }}-image
+          path: ./AtomVM/src/platforms/esp32/build/atomvm-${{ matrix.soc }}${{ matrix.flavor }}.img
+          if-no-files-found: error
+
+      - name: "Rename and write sha256sum"
+        shell: bash
+        working-directory: ./AtomVM/src/platforms/esp32/build
+        run: |
+          ATOMVM_IMG="AtomVM-esp32cam-${{ matrix.soc }}${{ matrix.flavor }}-${{ github.ref_name }}.img"
+          mv atomvm-${{ matrix.soc }}${{ matrix.flavor }}.img "${ATOMVM_IMG}"
+          sha256sum "${ATOMVM_IMG}" > "${ATOMVM_IMG}.sha256"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            ./AtomVM/src/platforms/esp32/build/AtomVM-esp32cam-${{ matrix.soc }}${{ matrix.flavor }}-${{ github.ref_name }}.img
+            ./AtomVM/src/platforms/esp32/build/AtomVM-esp32cam-${{ matrix.soc }}${{ matrix.flavor }}-${{ github.ref_name }}.img.sha256
+
+  publish:
+    name: "Publish new firmware and website to GitHub Pages"
+    runs-on: ubuntu-latest
+    needs: [build-and-release]
+    env:
+      SOCS: "esp32 esp32s3"
+      FLAVORS: "default elixir"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+      - name: Setup Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29.0"
+          rebar3-version: "3.27.0"
+      - name: Generate documentation
+        run: |
+          rebar3 ex_doc
+      - name: "Copy installer assets"
+        run: |
+          # Copy the static installer manifest as a fallback (overwritten by Create manifest.json step)
+          cp installer/manifest.json doc/manifest.json
+          cp installer/manifest.json doc/manifest-elixir.json
+      - uses: actions/download-artifact@v4
+        with:
+          path: output
+      - name: Create manifest.json
+        run: |
+          VERSION=$(git describe --tags 2>/dev/null || git rev-parse --short HEAD)
+          for flavor_key in $FLAVORS; do
+            if [ "$flavor_key" = "elixir" ]; then
+              flavor="-elixir"
+              manifest_file="manifest-elixir.json"
+            else
+              flavor=""
+              manifest_file="manifest.json"
+            fi
+
+            BUILDS_JSON="[]"
+            HAS_BUILDS=false
+            for soc in $SOCS; do
+              SRC_IMG="output/atomvm-esp32cam-${soc}${flavor}-image/atomvm-${soc}${flavor}.img"
+              if [ ! -f "$SRC_IMG" ]; then
+                echo "Artifact $SRC_IMG not found. Skipping."
+                continue
+              fi
+              HAS_BUILDS=true
+
+              if [ "$soc" = "esp32" ]; then
+                CHIP_FAMILY="ESP32"
+                OFFSET=4096
+              elif [ "$soc" = "esp32s3" ]; then
+                CHIP_FAMILY="ESP32-S3"
+                OFFSET=0
+              elif [ "$soc" = "esp32c3" ]; then
+                CHIP_FAMILY="ESP32-C3"
+                OFFSET=0
+              else
+                CHIP_FAMILY="ESP32"
+                OFFSET=4096
+              fi
+
+              ATOMVM_IMG="AtomVM-esp32cam-${soc}${flavor}-${{ github.ref_name }}.img"
+              cp "$SRC_IMG" "doc/${ATOMVM_IMG}"
+
+              BUILD_OBJ=$(jq -n \
+                --arg chip "$CHIP_FAMILY" \
+                --arg path "$ATOMVM_IMG" \
+                --argjson offset "$OFFSET" \
+                '{"chipFamily": $chip, "parts": [{"path": $path, "offset": $offset}]}')
+              BUILDS_JSON=$(echo "$BUILDS_JSON" | jq --argjson obj "$BUILD_OBJ" '. += [$obj]')
+            done
+
+            if [ "$HAS_BUILDS" = true ]; then
+              jq -n \
+                --arg name "AtomVM-esp32cam${flavor}-${{ github.ref_name }}" \
+                --arg version "$VERSION" \
+                --argjson builds "$BUILDS_JSON" \
+                '{"name": $name, "version": $version, "new_install_improv_wait_time": 0, "builds": $builds}' > "doc/${manifest_file}"
+            else
+              echo "No builds found for flavor: $flavor_key. Removing manifest placeholder."
+              rm -f "doc/${manifest_file}"
+            fi
+          done
+          ls -R doc
+
+      # Always upload the full site as a downloadable artifact (zip)
+      - name: "Upload site artifact (always available)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32cam-site
+          path: doc
+          if-no-files-found: error
+
+      # GitHub Pages deployment — optional, skipped if Pages is not configured
+      - name: Setup Pages
+        id: pages_setup
+        continue-on-error: true
+        uses: actions/configure-pages@v4
+      - name: Upload Pages artifact
+        if: steps.pages_setup.outcome == 'success'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: doc
+      - name: Deploy to GitHub Pages
+        if: steps.pages_setup.outcome == 'success'
+        id: deployment
+        uses: actions/deploy-pages@v4
