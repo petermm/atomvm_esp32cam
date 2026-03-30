@@ -183,7 +183,7 @@ static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
         if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
             RAISE_ERROR(MEMORY_ATOM);
         }
-        term error = port_create_error_tuple(ctx, term_from_int32(err));
+        term error = port_create_error_tuple(ctx, term_from_int28(err));
         return error;
     }
     camera_initialized = 1;
