@@ -21,20 +21,22 @@
 #include <driver/gpio.h>
 #include <esp32_sys.h>
 #include <esp_camera.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <interop.h>
 #include <nifs.h>
+#include <erl_nif_priv.h>
 #include <port.h>
 #include <sdkconfig.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <term.h>
 // GPIO control moved to Erlang level
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <resources.h>
 
-#define ENABLE_TRACE
-#include "trace.h"
-
-#define TAG "atomvm_esp32cam"
 #define DEFAULT_JPEG_QUALITY 12
 #define INVALID_JPEG_QUALITY -1
 #define DEFAULT_XCLK_FREQ_HZ 20000000
@@ -44,8 +46,35 @@
 #define DEFAULT_LEDC_CHANNEL 0
 #define DEFAULT_CONV_MODE 0
 #define MAX_WARM_UP_FRAMES 100
+#define MAX_TERM_IMAGE_SIZE 262144
+#define TERM_IMAGE_BASE64_BUFFER_SIZE 512
 #define INVALID_CONFIG_VALUE -1
 #define INVALID_PIN_VALUE -2
+
+struct CameraFrame {
+    camera_fb_t *fb;
+    bool released;
+    int active_views;
+};
+
+struct CameraView {
+    struct CameraFrame *frame;
+};
+
+static SemaphoreHandle_t camera_mutex = NULL;
+static int configured_fb_count = DEFAULT_FB_COUNT;
+static int outstanding_leases = 0;
+static ErlNifResourceType *camera_frame_resource_type = NULL;
+static ErlNifResourceType *camera_view_resource_type = NULL;
+static bool camera_resources_ready = false;
+
+#define LOCK()   xSemaphoreTakeRecursive(camera_mutex, portMAX_DELAY)
+#define UNLOCK() xSemaphoreGiveRecursive(camera_mutex)
+
+#define ENABLE_TRACE
+#include "trace.h"
+
+#define TAG "atomvm_esp32cam"
 
 // Board configuration structure
 typedef struct
@@ -617,11 +646,41 @@ static const char *const home_a = "\x4"
                                   "home";
 static const char *const undefined_a = "\x9"
                                        "undefined";
+static const char *const frames_in_use_a = "\xD"
+                                           "frames_in_use";
+static const char *const binary_views_active_a = "\x13"
+                                                 "binary_views_active";
+static const char *const already_released_a = "\x10"
+                                              "already_released";
+static const char *const size_a = "\x4"
+                                  "size";
+static const char *const width_a = "\x5"
+                                   "width";
+static const char *const height_a = "\x6"
+                                    "height";
+static const char *const timestamp_a = "\x9"
+                                       "timestamp";
+static const char *const enomem_a = "\x6"
+                                    "enomem";
+static const char *const too_large_a = "\x9"
+                                       "too_large";
+static const char *const io_error_a = "\x8"
+                                      "io_error";
+
 //                                                    123456789ABCDEF
 
 uint8_t camera_initialized = 0;
 board_type_t initialized_board_type = BOARD_INVALID;
 int initialized_flash_pin = -1;
+int initialized_xclk_pin = -1;
+
+static void deinit_camera_and_reset_xclk(int pin_xclk)
+{
+    esp_camera_deinit();
+    if (pin_xclk >= 0) {
+        gpio_reset_pin(pin_xclk);
+    }
+}
 
 static board_type_t get_board_type(Context *ctx, term board_term)
 {
@@ -971,15 +1030,22 @@ static bool is_valid_output_gpio(int pin)
     return GPIO_IS_VALID_OUTPUT_GPIO(pin);
 }
 
-static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
+static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
 {
     // Check if camera is already initialized
     if (camera_initialized) {
+        if (outstanding_leases > 0) {
+            if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+                RAISE_ERROR(MEMORY_ATOM);
+            }
+            return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, frames_in_use_a));
+        }
         ESP_LOGW(TAG, "Camera already initialized, deinitializing first");
-        esp_camera_deinit();
+        deinit_camera_and_reset_xclk(initialized_xclk_pin);
         camera_initialized = 0;
         initialized_board_type = BOARD_INVALID;
         initialized_flash_pin = -1;
+        initialized_xclk_pin = -1;
     }
 
     term config;
@@ -1275,7 +1341,7 @@ static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize esp_camera: err=0x%x (%s)", err, esp_err_to_name(err));
         ESP_LOGE(TAG, "Common causes: 1) Hardware not connected properly, 2) Pin conflicts, 3) PSRAM issues, 4) Power supply insufficient");
-        esp_camera_deinit();
+        deinit_camera_and_reset_xclk(selected_board_config->pin_xclk);
         if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
             RAISE_ERROR(MEMORY_ATOM);
         }
@@ -1328,7 +1394,7 @@ static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
         }
         if (sensor_err != 0) {
             ESP_LOGE(TAG, "Failed to apply camera settings: err=%d", sensor_err);
-            esp_camera_deinit();
+            deinit_camera_and_reset_xclk(selected_board_config->pin_xclk);
             if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
                 RAISE_ERROR(MEMORY_ATOM);
             }
@@ -1338,7 +1404,7 @@ static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
         || brightness_set || contrast_set || saturation_set
         || hmirror != INVALID_CONFIG_VALUE || vflip != INVALID_CONFIG_VALUE) {
         ESP_LOGW(TAG, "Could not get sensor pointer to apply camera settings");
-        esp_camera_deinit();
+        deinit_camera_and_reset_xclk(selected_board_config->pin_xclk);
         if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
             RAISE_ERROR(MEMORY_ATOM);
         }
@@ -1351,7 +1417,7 @@ static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
             camera_fb_t *fb = esp_camera_fb_get();
             if (!fb) {
                 ESP_LOGE(TAG, "Camera capture failed during warm-up at frame %d", (int) (i + 1));
-                esp_camera_deinit();
+                deinit_camera_and_reset_xclk(selected_board_config->pin_xclk);
                 if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
                     RAISE_ERROR(MEMORY_ATOM);
                 }
@@ -1361,13 +1427,28 @@ static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
         }
     }
 
+    configured_fb_count = fb_count;
+    outstanding_leases = 0;
     camera_initialized = 1;
     initialized_board_type = board_type;
     initialized_flash_pin = selected_board_config->pin_flash;
+    initialized_xclk_pin = selected_board_config->pin_xclk;
     return OK_ATOM;
 }
 
-static term nif_esp32cam_capture(Context *ctx, int argc, term argv[])
+static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_init_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_capture_locked(Context *ctx, int argc, term argv[])
 {
     UNUSED(argc);
     UNUSED(argv);
@@ -1398,7 +1479,19 @@ static term nif_esp32cam_capture(Context *ctx, int argc, term argv[])
     return port_create_tuple2(ctx, OK_ATOM, image);
 }
 
-static term nif_esp32cam_set_control(Context *ctx, int argc, term argv[])
+static term nif_esp32cam_capture(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_capture_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_set_control_locked(Context *ctx, int argc, term argv[])
 {
     if (argc != 2) {
         RAISE_ERROR(BADARG_ATOM);
@@ -1515,7 +1608,19 @@ static term nif_esp32cam_set_control(Context *ctx, int argc, term argv[])
     return OK_ATOM;
 }
 
-static term nif_esp32cam_get_board_info(Context *ctx, int argc, term argv[])
+static term nif_esp32cam_set_control(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_set_control_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_get_board_info_locked(Context *ctx, int argc, term argv[])
 {
     UNUSED(argc);
     UNUSED(argv);
@@ -1553,6 +1658,366 @@ static term nif_esp32cam_get_board_info(Context *ctx, int argc, term argv[])
     return port_create_tuple2(ctx, board_atom, flash_pin_term);
 }
 
+static term nif_esp32cam_get_board_info(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_get_board_info_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_psram_size(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+
+    if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    return term_from_int(total_psram);
+}
+
+static term pixformat_to_term(pixformat_t format, Context *ctx)
+{
+    switch (format) {
+        case PIXFORMAT_RGB565: return globalcontext_make_atom(ctx->global, rgb565_a);
+        case PIXFORMAT_YUV422: return globalcontext_make_atom(ctx->global, yuv422_a);
+        case PIXFORMAT_YUV420: return globalcontext_make_atom(ctx->global, yuv420_a);
+        case PIXFORMAT_GRAYSCALE: return globalcontext_make_atom(ctx->global, grayscale_a);
+        case PIXFORMAT_JPEG: return globalcontext_make_atom(ctx->global, jpeg_a);
+        case PIXFORMAT_RGB888: return globalcontext_make_atom(ctx->global, rgb888_a);
+        case PIXFORMAT_RAW: return globalcontext_make_atom(ctx->global, raw_a);
+        case PIXFORMAT_RGB444: return globalcontext_make_atom(ctx->global, rgb444_a);
+        case PIXFORMAT_RGB555: return globalcontext_make_atom(ctx->global, rgb555_a);
+        case PIXFORMAT_RAW8: return globalcontext_make_atom(ctx->global, raw8_a);
+        default: return globalcontext_make_atom(ctx->global, undefined_a);
+    }
+}
+
+static void camera_frame_dtor(ErlNifEnv *caller_env, void *obj)
+{
+    UNUSED(caller_env);
+    struct CameraFrame *frame = (struct CameraFrame *) obj;
+    LOCK();
+    if (!frame->released) {
+        if (frame->fb != NULL) {
+            esp_camera_fb_return(frame->fb);
+            frame->fb = NULL;
+        }
+        frame->released = true;
+        outstanding_leases--;
+    }
+    UNLOCK();
+}
+
+static void camera_view_dtor(ErlNifEnv *caller_env, void *obj)
+{
+    UNUSED(caller_env);
+    struct CameraView *view = (struct CameraView *) obj;
+    LOCK();
+    if (view->frame != NULL) {
+        view->frame->active_views--;
+        struct CameraFrame *frame = view->frame;
+        view->frame = NULL;
+        enif_release_resource(frame);
+    }
+    UNLOCK();
+}
+
+static const ErlNifResourceTypeInit camera_frame_resource_type_init = {
+    .members = 1,
+    .dtor = camera_frame_dtor,
+    .stop = NULL,
+    .down = NULL
+};
+
+static const ErlNifResourceTypeInit camera_view_resource_type_init = {
+    .members = 1,
+    .dtor = camera_view_dtor,
+    .stop = NULL,
+    .down = NULL
+};
+
+static term nif_esp32cam_capture_frame(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    if (!camera_initialized) {
+        UNLOCK();
+        ESP_LOGE(TAG, "Camera not initialized! Call esp32cam:init() first.");
+        RAISE_ERROR(globalcontext_make_atom(ctx->global, bad_state_a));
+    }
+
+    if (UNLIKELY(memory_ensure_free(ctx, TERM_BOXED_REFERENCE_RESOURCE_SIZE + 3) != MEMORY_GC_OK)) {
+        UNLOCK();
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    if (outstanding_leases >= configured_fb_count) {
+        UNLOCK();
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, frames_in_use_a));
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        UNLOCK();
+        ESP_LOGE(TAG, "Camera capture failed");
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, capture_failed_a));
+    }
+
+    struct CameraFrame *frame = enif_alloc_resource(camera_frame_resource_type, sizeof(struct CameraFrame));
+    if (IS_NULL_PTR(frame)) {
+        esp_camera_fb_return(fb);
+        UNLOCK();
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, enomem_a));
+    }
+
+    frame->fb = fb;
+    frame->released = false;
+    frame->active_views = 0;
+    outstanding_leases++;
+
+    term frame_term = term_from_resource(frame, &ctx->heap);
+    enif_release_resource(frame);
+
+    term result = port_create_tuple2(ctx, OK_ATOM, frame_term);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_frame_binary(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    void *frame_ptr;
+    if (UNLIKELY(!enif_get_resource(erl_nif_env_from_context(ctx), argv[0], camera_frame_resource_type, &frame_ptr))) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    struct CameraFrame *frame = (struct CameraFrame *) frame_ptr;
+
+    if (UNLIKELY(memory_ensure_free(ctx, 16) != MEMORY_GC_OK)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    if (frame->released) {
+        UNLOCK();
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, already_released_a));
+    }
+
+    struct CameraView *view = enif_alloc_resource(camera_view_resource_type, sizeof(struct CameraView));
+    if (IS_NULL_PTR(view)) {
+        UNLOCK();
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, enomem_a));
+    }
+
+    view->frame = frame;
+    frame->active_views++;
+    enif_keep_resource(frame);
+
+    term bin_term = term_from_resource_binary(view, frame->fb->buf, frame->fb->len, &ctx->heap, ctx->global);
+    enif_release_resource(view);
+
+    term result = port_create_tuple2(ctx, OK_ATOM, bin_term);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_frame_info(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    void *frame_ptr;
+    if (UNLIKELY(!enif_get_resource(erl_nif_env_from_context(ctx), argv[0], camera_frame_resource_type, &frame_ptr))) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    struct CameraFrame *frame = (struct CameraFrame *) frame_ptr;
+
+    if (UNLIKELY(memory_ensure_free(ctx, 32) != MEMORY_GC_OK)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    if (frame->released) {
+        UNLOCK();
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, already_released_a));
+    }
+
+    term size_val = term_from_int(frame->fb->len);
+    term width_val = term_from_int(frame->fb->width);
+    term height_val = term_from_int(frame->fb->height);
+    term format_val = pixformat_to_term(frame->fb->format, ctx);
+
+    time_t sec = frame->fb->timestamp.tv_sec;
+    suseconds_t usec = frame->fb->timestamp.tv_usec;
+    term megaseconds = term_from_int(sec / 1000000);
+    term seconds = term_from_int(sec % 1000000);
+    term microseconds = term_from_int(usec);
+
+    term timestamp_tuple = port_create_tuple3(ctx, megaseconds, seconds, microseconds);
+
+    term map = term_alloc_map(5, &ctx->heap);
+    term_set_map_assoc(map, 0, globalcontext_make_atom(ctx->global, size_a), size_val);
+    term_set_map_assoc(map, 1, globalcontext_make_atom(ctx->global, width_a), width_val);
+    term_set_map_assoc(map, 2, globalcontext_make_atom(ctx->global, height_a), height_val);
+    term_set_map_assoc(map, 3, globalcontext_make_atom(ctx->global, pixel_format_a), format_val);
+    term_set_map_assoc(map, 4, globalcontext_make_atom(ctx->global, timestamp_a), timestamp_tuple);
+
+    term result = port_create_tuple2(ctx, OK_ATOM, map);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_release_frame(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    void *frame_ptr;
+    if (UNLIKELY(!enif_get_resource(erl_nif_env_from_context(ctx), argv[0], camera_frame_resource_type, &frame_ptr))) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    struct CameraFrame *frame = (struct CameraFrame *) frame_ptr;
+
+    if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    if (frame->released) {
+        UNLOCK();
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, already_released_a));
+    }
+
+    if (frame->active_views > 0) {
+        UNLOCK();
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, binary_views_active_a));
+    }
+
+    esp_camera_fb_return(frame->fb);
+    frame->fb = NULL;
+    frame->released = true;
+    outstanding_leases--;
+
+    UNLOCK();
+    return OK_ATOM;
+}
+
+static bool term_image_write(const void *data, size_t size)
+{
+    return fwrite(data, 1, size, stdout) == size;
+}
+
+static bool term_image_write_base64(const uint8_t *data, size_t size)
+{
+    static const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char output[TERM_IMAGE_BASE64_BUFFER_SIZE];
+    size_t input_pos = 0;
+    size_t output_pos = 0;
+
+    while (input_pos + 3 <= size) {
+        if (output_pos + 4 > sizeof(output)) {
+            if (!term_image_write(output, output_pos)) {
+                return false;
+            }
+            output_pos = 0;
+        }
+
+        uint32_t value = ((uint32_t) data[input_pos] << 16)
+            | ((uint32_t) data[input_pos + 1] << 8)
+            | data[input_pos + 2];
+        output[output_pos++] = base64_table[(value >> 18) & 0x3F];
+        output[output_pos++] = base64_table[(value >> 12) & 0x3F];
+        output[output_pos++] = base64_table[(value >> 6) & 0x3F];
+        output[output_pos++] = base64_table[value & 0x3F];
+        input_pos += 3;
+    }
+
+    size_t remaining = size - input_pos;
+    if (remaining > 0) {
+        if (output_pos + 4 > sizeof(output)) {
+            if (!term_image_write(output, output_pos)) {
+                return false;
+            }
+            output_pos = 0;
+        }
+
+        uint32_t value = (uint32_t) data[input_pos] << 16;
+        if (remaining == 2) {
+            value |= (uint32_t) data[input_pos + 1] << 8;
+        }
+        output[output_pos++] = base64_table[(value >> 18) & 0x3F];
+        output[output_pos++] = base64_table[(value >> 12) & 0x3F];
+        output[output_pos++] = remaining == 2 ? base64_table[(value >> 6) & 0x3F] : '=';
+        output[output_pos++] = '=';
+    }
+
+    return output_pos == 0 || term_image_write(output, output_pos);
+}
+
+static term nif_term_image_display_frame(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    void *frame_ptr;
+    if (UNLIKELY(!enif_get_resource(erl_nif_env_from_context(ctx), argv[0], camera_frame_resource_type, &frame_ptr))) {
+        return port_create_error_tuple(ctx, BADARG_ATOM);
+    }
+
+    struct CameraFrame *frame = (struct CameraFrame *) frame_ptr;
+    LOCK();
+    if (frame->released) {
+        UNLOCK();
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, already_released_a));
+    }
+    if (frame->fb->len > MAX_TERM_IMAGE_SIZE) {
+        UNLOCK();
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, too_large_a));
+    }
+
+    bool output_ok = fprintf(stdout, "\n\n\e]1337;File=size=%zu;inline=1:", frame->fb->len) >= 0
+        && term_image_write_base64(frame->fb->buf, frame->fb->len)
+        && term_image_write("\a\n", 2)
+        && fflush(stdout) == 0;
+    UNLOCK();
+
+    if (!output_ok) {
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, io_error_a));
+    }
+    return OK_ATOM;
+}
+
 static const struct Nif esp32cam_init_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_esp32cam_init
@@ -1569,10 +2034,50 @@ static const struct Nif esp32cam_get_board_info_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_esp32cam_get_board_info
 };
+static const struct Nif esp32cam_capture_frame_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_esp32cam_capture_frame
+};
+static const struct Nif esp32cam_frame_binary_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_esp32cam_frame_binary
+};
+static const struct Nif esp32cam_frame_info_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_esp32cam_frame_info
+};
+static const struct Nif esp32cam_release_frame_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_esp32cam_release_frame
+};
+static const struct Nif esp32cam_psram_size_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_esp32cam_psram_size
+};
+static const struct Nif term_image_display_frame_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_term_image_display_frame
+};
 
 void atomvm_esp32cam_init(GlobalContext *global)
 {
-    // no-op
+    camera_mutex = xSemaphoreCreateRecursiveMutex();
+    if (IS_NULL_PTR(camera_mutex)) {
+        ESP_LOGE(TAG, "Failed to allocate camera mutex");
+        return;
+    }
+
+    ErlNifEnv env;
+    erl_nif_env_partial_init_from_globalcontext(&env, global);
+    camera_frame_resource_type = enif_init_resource_type(&env, "camera_frame", &camera_frame_resource_type_init, ERL_NIF_RT_CREATE, NULL);
+    camera_view_resource_type = enif_init_resource_type(&env, "camera_view", &camera_view_resource_type_init, ERL_NIF_RT_CREATE, NULL);
+
+    if (IS_NULL_PTR(camera_frame_resource_type) || IS_NULL_PTR(camera_view_resource_type)) {
+        ESP_LOGE(TAG, "Failed to initialize camera resource types");
+        return;
+    }
+
+    camera_resources_ready = true;
 }
 
 const struct Nif *atomvm_esp32cam_get_nif(const char *nifname)
@@ -1592,6 +2097,30 @@ const struct Nif *atomvm_esp32cam_get_nif(const char *nifname)
     if (strcmp("esp32cam:get_board_info_nif/0", nifname) == 0) {
         TRACE("Resolved platform nif %s ...\n", nifname);
         return &esp32cam_get_board_info_nif;
+    }
+    if (strcmp("esp32cam:capture_frame_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_capture_frame_nif;
+    }
+    if (strcmp("esp32cam:frame_binary_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_frame_binary_nif;
+    }
+    if (strcmp("esp32cam:frame_info_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_frame_info_nif;
+    }
+    if (strcmp("esp32cam:release_frame_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_release_frame_nif;
+    }
+    if (strcmp("esp32cam:psram_size_nif/0", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_psram_size_nif;
+    }
+    if (strcmp("term_image:display_frame_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &term_image_display_frame_nif;
     }
 
     return NULL;

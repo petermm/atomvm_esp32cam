@@ -9,6 +9,14 @@
     capture/1,
     capture_with_flash/1,
     capture_with_flash/2,
+    capture_frame/0,
+    capture_frame/1,
+    frame_binary/1,
+    frame_info/1,
+    release_frame/1,
+    psram_size/0,
+    collect_binary_view/1,
+    collect_frame/1,
     start_mock_mode/0,
     stop_mock_mode/0,
     set_mock_behavior/1
@@ -181,7 +189,102 @@ capture_with_flash(FlashOptions, CaptureParams) ->
             end
     end.
 
+capture_frame() ->
+    case is_mock_mode() of
+        true ->
+            mock_capture_frame([]);
+        false ->
+            try
+                esp32cam:capture_frame()
+            catch
+                throw:nif_error -> mock_capture_frame([]);
+                _:_ -> mock_capture_frame([])
+            end
+    end.
+
+capture_frame(Params) ->
+    case is_mock_mode() of
+        true ->
+            mock_capture_frame(Params);
+        false ->
+            try
+                esp32cam:capture_frame(Params)
+            catch
+                throw:nif_error -> mock_capture_frame(Params);
+                _:_ -> mock_capture_frame(Params)
+            end
+    end.
+
+frame_binary(Frame) ->
+    case is_mock_mode() of
+        true ->
+            mock_frame_binary(Frame);
+        false ->
+            try
+                esp32cam:frame_binary(Frame)
+            catch
+                throw:nif_error -> mock_frame_binary(Frame);
+                _:_ -> mock_frame_binary(Frame)
+            end
+    end.
+
+frame_info(Frame) ->
+    case is_mock_mode() of
+        true ->
+            mock_frame_info(Frame);
+        false ->
+            try
+                esp32cam:frame_info(Frame)
+            catch
+                throw:nif_error -> mock_frame_info(Frame);
+                _:_ -> mock_frame_info(Frame)
+            end
+    end.
+
+release_frame(Frame) ->
+    case is_mock_mode() of
+        true ->
+            mock_release_frame(Frame);
+        false ->
+            try
+                esp32cam:release_frame(Frame)
+            catch
+                throw:nif_error -> mock_release_frame(Frame);
+                _:_ -> mock_release_frame(Frame)
+            end
+    end.
+
+psram_size() ->
+    case is_mock_mode() of
+        true ->
+            mock_psram_size();
+        false ->
+            try
+                esp32cam:psram_size()
+            catch
+                throw:nif_error -> mock_psram_size();
+                _:_ -> mock_psram_size()
+            end
+    end.
+
+collect_binary_view(View) ->
+    case is_mock_mode() of
+        true ->
+            mock_collect_binary_view(View);
+        false ->
+            ok
+    end.
+
+collect_frame(Frame) ->
+    case is_mock_mode() of
+        true ->
+            mock_collect_frame(Frame);
+        false ->
+            ok
+    end.
+
 %%-----------------------------------------------------------------------------
+%% Mock Implementation
 %% Mock Implementation
 %%-----------------------------------------------------------------------------
 
@@ -192,25 +295,42 @@ is_mock_mode() ->
 %% Mock initialization implementation
 mock_init(Config) ->
     Behavior = get(?MOCK_BEHAVIOR_KEY),
-    erase(esp32cam_current_board),
-    erase(esp32cam_custom_flash_pin),
-    clear_init_controls(),
-
-    case Behavior of
-        always_error ->
-            {error, mock_init_failed};
-        _ ->
-            case esp32cam:validate_init_config(Config) of
-                {ok, Board} ->
-                    put(esp32cam_current_board, Board),
-                    store_custom_flash_pin(Config, Board),
-                    store_init_controls(Config),
-
-                    % Simulate GPIO initialization
-                    %% Mock initialization with board
-                    ok;
-                Error ->
-                    Error
+    HasLeases =
+        case get(esp32cam_current_board) of
+            undefined ->
+                false;
+            _ ->
+                case get(esp32cam_mock_outstanding_leases) of
+                    Leases when is_integer(Leases), Leases > 0 -> true;
+                    _ -> false
+                end
+        end,
+    case HasLeases of
+        true ->
+            {error, frames_in_use};
+        false ->
+            erase(esp32cam_current_board),
+            erase(esp32cam_custom_flash_pin),
+            clear_init_controls(),
+            case Behavior of
+                always_error ->
+                    {error, mock_init_failed};
+                _ ->
+                    case esp32cam:validate_init_config(Config) of
+                        {ok, Board} ->
+                            put(esp32cam_current_board, Board),
+                            store_custom_flash_pin(Config, Board),
+                            store_init_controls(Config),
+                            ResolvedFbCount = esp32cam:resolve_fb_count(
+                                proplists:get_value(fb_count, Config, auto),
+                                Config
+                            ),
+                            put(esp32cam_mock_fb_count, ResolvedFbCount),
+                            put(esp32cam_mock_outstanding_leases, 0),
+                            ok;
+                        Error ->
+                            Error
+                    end
             end
     end.
 
@@ -415,6 +535,157 @@ generate_mock_image(FlashUsed) ->
             {ok, <<?MOCK_IMAGE_DATA/binary, ExtraData/binary>>};
         false ->
             {ok, ?MOCK_IMAGE_DATA}
+    end.
+
+%% Mock frame implementations
+mock_capture_frame(Params) ->
+    case ensure_initialized() of
+        ok ->
+            Behavior = get(?MOCK_BEHAVIOR_KEY),
+            case Behavior of
+                always_error ->
+                    {error, mock_capture_failed};
+                _ ->
+                    case validate_capture_params(Params) of
+                        ok ->
+                            FbCount =
+                                case get(esp32cam_mock_fb_count) of
+                                    undefined -> 1;
+                                    Val -> Val
+                                end,
+                            Leases =
+                                case get(esp32cam_mock_outstanding_leases) of
+                                    undefined -> 0;
+                                    L -> L
+                                end,
+                            if
+                                Leases >= FbCount ->
+                                    {error, frames_in_use};
+                                true ->
+                                    Ref = make_ref(),
+                                    put(esp32cam_mock_outstanding_leases, Leases + 1),
+                                    Bin = ?MOCK_IMAGE_DATA,
+                                    Format = jpeg,
+                                    Width = 1024,
+                                    Height = 768,
+                                    Timestamp = {1700, 0, 0},
+                                    put({mock_frame, Ref}, #{
+                                        fb_len => byte_size(Bin),
+                                        fb_width => Width,
+                                        fb_height => Height,
+                                        format => Format,
+                                        timestamp => Timestamp,
+                                        binary => Bin,
+                                        active_views => 0,
+                                        released => false
+                                    }),
+                                    {ok, {mock_frame, Ref}}
+                            end;
+                        Error ->
+                            Error
+                    end
+            end;
+        Error ->
+            Error
+    end.
+
+mock_frame_binary({mock_frame, Ref}) ->
+    case get({mock_frame, Ref}) of
+        undefined ->
+            {error, badarg};
+        #{released := true} ->
+            {error, already_released};
+        FrameMap ->
+            ActiveViews = maps:get(active_views, FrameMap),
+            NewFrameMap = FrameMap#{active_views => ActiveViews + 1},
+            put({mock_frame, Ref}, NewFrameMap),
+            {ok, maps:get(binary, FrameMap)}
+    end;
+mock_frame_binary(_) ->
+    {error, badarg}.
+
+mock_frame_info({mock_frame, Ref}) ->
+    case get({mock_frame, Ref}) of
+        undefined ->
+            {error, badarg};
+        #{released := true} ->
+            {error, already_released};
+        FrameMap ->
+            Info = #{
+                size => maps:get(fb_len, FrameMap),
+                width => maps:get(fb_width, FrameMap),
+                height => maps:get(fb_height, FrameMap),
+                pixel_format => maps:get(format, FrameMap),
+                timestamp => maps:get(timestamp, FrameMap)
+            },
+            {ok, Info}
+    end;
+mock_frame_info(_) ->
+    {error, badarg}.
+
+mock_release_frame({mock_frame, Ref}) ->
+    case get({mock_frame, Ref}) of
+        undefined ->
+            {error, badarg};
+        #{released := true} ->
+            {error, already_released};
+        FrameMap ->
+            case maps:get(active_views, FrameMap) of
+                N when N > 0 ->
+                    {error, binary_views_active};
+                _ ->
+                    NewFrameMap = FrameMap#{released => true},
+                    put({mock_frame, Ref}, NewFrameMap),
+                    Leases = get(esp32cam_mock_outstanding_leases),
+                    put(esp32cam_mock_outstanding_leases, max(0, Leases - 1)),
+                    ok
+            end
+    end;
+mock_release_frame(_) ->
+    {error, badarg}.
+
+mock_collect_binary_view({mock_frame, Ref}) ->
+    case get({mock_frame, Ref}) of
+        undefined ->
+            {error, badarg};
+        FrameMap ->
+            case maps:get(active_views, FrameMap) of
+                0 ->
+                    {error, badarg};
+                ActiveViews ->
+                    NewFrameMap = FrameMap#{active_views => ActiveViews - 1},
+                    put({mock_frame, Ref}, NewFrameMap),
+                    ok
+            end
+    end;
+mock_collect_binary_view(_) ->
+    {error, badarg}.
+
+mock_collect_frame({mock_frame, Ref}) ->
+    case get({mock_frame, Ref}) of
+        undefined ->
+            {error, badarg};
+        #{active_views := ActiveViews} when ActiveViews > 0 ->
+            {error, binary_views_active};
+        FrameMap ->
+            case maps:get(released, FrameMap) of
+                true ->
+                    erase({mock_frame, Ref}),
+                    ok;
+                false ->
+                    erase({mock_frame, Ref}),
+                    Leases = get(esp32cam_mock_outstanding_leases),
+                    put(esp32cam_mock_outstanding_leases, max(0, Leases - 1)),
+                    ok
+            end
+    end;
+mock_collect_frame(_) ->
+    {error, badarg}.
+
+mock_psram_size() ->
+    case get(esp32cam_mock_psram_size) of
+        undefined -> 4194304;
+        Size -> Size
     end.
 
 %%-----------------------------------------------------------------------------

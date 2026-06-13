@@ -23,11 +23,22 @@
     set_control_nif/2,
     capture/0, capture/1,
     capture_nif/1,
+    capture_frame/0, capture_frame/1,
+    capture_frame_nif/1,
+    frame_binary/1,
+    frame_binary_nif/1,
+    frame_info/1,
+    frame_info_nif/1,
+    release_frame/1,
+    release_frame_nif/1,
     capture_with_flash/1, capture_with_flash/2,
     has_flash/0, has_flash/1,
     validate_init_config/1,
     get_board_info/0,
-    get_board_info_nif/0
+    get_board_info_nif/0,
+    psram_size/0,
+    psram_size_nif/0,
+    resolve_fb_count/2
 ]).
 
 -define(SUPPORTED_BOARDS, [
@@ -131,7 +142,7 @@
     | {pixel_format,
         jpeg | grayscale | rgb565 | yuv422 | yuv420 | rgb888 | raw | rgb444 | rgb555 | raw8}
     | {xclk_freq_hz, pos_integer()}
-    | {fb_count, pos_integer()}
+    | {fb_count, pos_integer() | auto}
     | {fb_location, psram | dram}
     | {grab_mode, when_empty | latest}
     | {sccb_i2c_port, non_neg_integer()}
@@ -173,6 +184,8 @@
     wb_mode | auto_white_balance | awb_gain | brightness | contrast | saturation | hmirror | vflip.
 -type control_value() :: auto | sunny | cloudy | office | home | boolean() | -2..2.
 -type image() :: binary().
+-opaque frame() :: term().
+-export_type([frame/0]).
 
 %% Flash pin mappings for different boards
 -define(FLASH_PINS, #{
@@ -302,6 +315,35 @@ capture_with_flash_control(CaptureParams, DelayMs) ->
             Error
     end.
 
+%% Capture frame with flash control
+capture_frame_with_flash_control(CaptureParams, DelayMs) ->
+    case init_flash_gpio() of
+        ok ->
+            try
+                case control_flash(on) of
+                    ok ->
+                        % Optional pre-shot delay
+                        case DelayMs of
+                            0 -> ok;
+                            _ -> timer:sleep(DelayMs)
+                        end,
+
+                        % Capture frame
+                        esp32cam:capture_frame_nif(strip_flash_params(CaptureParams));
+                    GpioError ->
+                        GpioError
+                end
+            catch
+                Class:Reason ->
+                    {error, {Class, Reason}}
+            after
+                % Always turn off flash, including capture errors.
+                _ = control_flash(off)
+            end;
+        Error ->
+            Error
+    end.
+
 validate_capture_params(CaptureParams) ->
     validate_options(CaptureParams, fun validate_capture_param/1).
 
@@ -352,6 +394,18 @@ strip_flash_params(CaptureParams) ->
 capture_nif(_CaptureParams) ->
     throw(nif_error).
 
+capture_frame_nif(_CaptureParams) ->
+    throw(nif_error).
+
+frame_binary_nif(_Frame) ->
+    throw(nif_error).
+
+frame_info_nif(_Frame) ->
+    throw(nif_error).
+
+release_frame_nif(_Frame) ->
+    throw(nif_error).
+
 %%-----------------------------------------------------------------------------
 %% @returns `ok' or error with reason
 %% @doc     Initialize the camera.
@@ -375,7 +429,9 @@ init(Config) ->
         {ok, _} ->
             erase(?BOARD_KEY),
             erase(?CUSTOM_FLASH_PIN_KEY),
-            case esp32cam:init_nif(Config) of
+            ResolvedFbCount = resolve_fb_count(proplists:get_value(fb_count, Config, auto), Config),
+            ResolvedConfig = [{fb_count, ResolvedFbCount} | proplists:delete(fb_count, Config)],
+            case esp32cam:init_nif(ResolvedConfig) of
                 ok ->
                     % Store board type for flash control after init succeeds.
                     store_board_type(Config),
@@ -465,6 +521,66 @@ capture(CaptureParams) ->
         Error ->
             Error
     end.
+
+%%-----------------------------------------------------------------------------
+%% @returns `ok' with the camera frame reference, or error.
+%% @doc     Capture a frame with the camera leasing the PSRAM framebuffer.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec capture_frame() -> {ok, frame()} | {error, Reason :: term()}.
+capture_frame() ->
+    esp32cam:capture_frame_nif([]).
+
+%%-----------------------------------------------------------------------------
+%% @param   CaptureParams capture parameters
+%% @returns `ok' with the camera frame reference, or error.
+%% @doc     Capture a frame with the camera leasing the PSRAM framebuffer.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec capture_frame(CaptureParams :: capture_params()) -> {ok, frame()} | {error, Reason :: term()}.
+capture_frame(CaptureParams) ->
+    case validate_capture_params(CaptureParams) of
+        ok ->
+            case lists:keyfind(flash, 1, CaptureParams) of
+                {flash, on} ->
+                    FlashDelay = proplists:get_value(flash_delay_ms, CaptureParams, 0),
+                    capture_frame_with_flash_control(CaptureParams, FlashDelay);
+                _ ->
+                    esp32cam:capture_frame_nif(strip_flash_params(CaptureParams))
+            end;
+        Error ->
+            Error
+    end.
+
+%%-----------------------------------------------------------------------------
+%% @param   Frame camera frame reference
+%% @returns `{ok, binary()}' with a zero-copy view of the frame data, or error.
+%% @doc     Return a zero-copy view of the frame data as a resource-managed binary.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec frame_binary(Frame :: frame()) -> {ok, binary()} | {error, Reason :: term()}.
+frame_binary(Frame) ->
+    esp32cam:frame_binary_nif(Frame).
+
+%%-----------------------------------------------------------------------------
+%% @param   Frame camera frame reference
+%% @returns `{ok, map()}' with frame metadata, or error.
+%% @doc     Get metadata info of a frame.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec frame_info(Frame :: frame()) -> {ok, map()} | {error, Reason :: term()}.
+frame_info(Frame) ->
+    esp32cam:frame_info_nif(Frame).
+
+%%-----------------------------------------------------------------------------
+%% @param   Frame camera frame reference
+%% @returns `ok' or error.
+%% @doc     Explicitly release a leased camera frame back to the driver.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec release_frame(Frame :: frame()) -> ok | {error, Reason :: term()}.
+release_frame(Frame) ->
+    esp32cam:release_frame_nif(Frame).
 
 %%-----------------------------------------------------------------------------
 %% @param   FlashOptions flash control options
@@ -562,6 +678,26 @@ get_board_info_nif() ->
     throw(nif_error).
 
 %%-----------------------------------------------------------------------------
+%% @returns Total PSRAM size in bytes, or `undefined' / `0' if not available.
+%% @doc     Query the total PSRAM size.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec psram_size() -> integer() | undefined.
+psram_size() ->
+    try
+        esp32cam:psram_size_nif()
+    catch
+        throw:nif_error ->
+            case get(esp32cam_mock_psram_size) of
+                undefined -> undefined;
+                Size -> Size
+            end
+    end.
+
+psram_size_nif() ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
 %% Configuration Validation
 %%-----------------------------------------------------------------------------
 validate_init_config(Config) when is_list(Config) ->
@@ -570,7 +706,7 @@ validate_init_config(Config) when is_list(Config) ->
     JpegQuality = proplists:get_value(jpeg_quality, Config, 12),
     PixelFormat = proplists:get_value(pixel_format, Config, jpeg),
     XclkFreqHz = proplists:get_value(xclk_freq_hz, Config, 20000000),
-    FbCount = proplists:get_value(fb_count, Config, 1),
+    FbCount = proplists:get_value(fb_count, Config, auto),
     FbLocation = proplists:get_value(fb_location, Config, psram),
     GrabMode = proplists:get_value(grab_mode, Config, when_empty),
     SccbI2CPort = proplists:get_value(sccb_i2c_port, Config, 0),
@@ -599,7 +735,10 @@ validate_init_config(Config) when is_list(Config) ->
                 {invalid_pixel_format, PixelFormat}
             },
             {is_integer(XclkFreqHz) andalso XclkFreqHz > 0, {invalid_xclk_freq_hz, XclkFreqHz}},
-            {is_integer(FbCount) andalso FbCount > 0, {invalid_fb_count, FbCount}},
+            {
+                (FbCount =:= auto) orelse (is_integer(FbCount) andalso FbCount > 0),
+                {invalid_fb_count, FbCount}
+            },
             {lists:member(FbLocation, ?SUPPORTED_FB_LOCATIONS), {invalid_fb_location, FbLocation}},
             {lists:member(GrabMode, ?SUPPORTED_GRAB_MODES), {invalid_grab_mode, GrabMode}},
             {
@@ -716,3 +855,80 @@ first_config_error([{false, Reason} | _]) ->
     {error, Reason};
 first_config_error([]) ->
     ok.
+
+resolve_fb_count(auto, Config) ->
+    case proplists:get_value(fb_location, Config, psram) of
+        dram ->
+            1;
+        psram ->
+            case psram_size() of
+                undefined ->
+                    1;
+                0 ->
+                    1;
+                PsramSize ->
+                    FrameSize = proplists:get_value(frame_size, Config, xga),
+                    PixelFormat = proplists:get_value(pixel_format, Config, jpeg),
+                    EstimatedSize = estimate_frame_size(FrameSize, PixelFormat),
+                    MaxBufferMem = PsramSize div 4,
+                    if
+                        EstimatedSize * 3 =< MaxBufferMem -> 3;
+                        EstimatedSize * 2 =< MaxBufferMem -> 2;
+                        true -> 1
+                    end
+            end
+    end;
+resolve_fb_count(FbCount, _Config) when is_integer(FbCount) ->
+    FbCount.
+
+estimate_frame_size(FrameSize, jpeg) ->
+    case FrameSize of
+        '5mp' -> 500000;
+        qxga -> 500000;
+        fhd -> 500000;
+        uxga -> 300000;
+        sxga -> 300000;
+        hd -> 300000;
+        xga -> 150000;
+        svga -> 150000;
+        _ -> 75000
+    end;
+estimate_frame_size(FrameSize, PixelFormat) ->
+    {W, H} = resolution_dimensions(FrameSize),
+    BPP = bytes_per_pixel(PixelFormat),
+    W * H * BPP.
+
+resolution_dimensions('96x96') -> {96, 96};
+resolution_dimensions(qqvga) -> {160, 120};
+resolution_dimensions('128x128') -> {128, 128};
+resolution_dimensions(qcif) -> {176, 144};
+resolution_dimensions(hqvga) -> {240, 176};
+resolution_dimensions('240x240') -> {240, 240};
+resolution_dimensions(qvga) -> {320, 240};
+resolution_dimensions('320x320') -> {320, 320};
+resolution_dimensions(cif) -> {400, 296};
+resolution_dimensions(hvga) -> {480, 320};
+resolution_dimensions(vga) -> {640, 480};
+resolution_dimensions(svga) -> {800, 600};
+resolution_dimensions(xga) -> {1024, 768};
+resolution_dimensions(hd) -> {1280, 720};
+resolution_dimensions(sxga) -> {1280, 1024};
+resolution_dimensions(uxga) -> {1600, 1200};
+resolution_dimensions(fhd) -> {1920, 1080};
+resolution_dimensions(p_hd) -> {720, 1280};
+resolution_dimensions(p_3mp) -> {864, 1536};
+resolution_dimensions(qxga) -> {2048, 1536};
+resolution_dimensions(qhd) -> {2560, 1440};
+resolution_dimensions(wqxga) -> {2560, 1600};
+resolution_dimensions(p_fhd) -> {1080, 1920};
+resolution_dimensions(qsxga) -> {2048, 1536};
+resolution_dimensions('5mp') -> {2592, 1944};
+resolution_dimensions(_) -> {640, 480}.
+
+bytes_per_pixel(rgb565) -> 2;
+bytes_per_pixel(yuv422) -> 2;
+bytes_per_pixel(rgb888) -> 3;
+bytes_per_pixel(grayscale) -> 1;
+bytes_per_pixel(raw) -> 1;
+bytes_per_pixel(raw8) -> 1;
+bytes_per_pixel(_) -> 2.

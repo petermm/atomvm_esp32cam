@@ -16,7 +16,18 @@
 %%
 -module(esp32cam_example).
 
--export([start/0, test_custom_ai_thinker/0, demo_white_balance_and_warm_up/1, demo_runtime_controls/1]).
+-export([
+    start/0,
+    test_custom_ai_thinker/0,
+    demo_white_balance_and_warm_up/1,
+    demo_runtime_controls/1,
+    zero_copy_stress/1,
+    zero_copy_stress/2
+]).
+
+-define(DEFAULT_ZERO_COPY_ITERATIONS, 100).
+-define(ZERO_COPY_PROGRESS_INTERVAL, 10).
+-define(ZERO_COPY_DISPLAY_BURST, 5).
 
 start() ->
     io:format("=== Camera Auto-Detection & Demo ===~n"),
@@ -51,7 +62,11 @@ start() ->
                     test_custom_ai_thinker();
                 _ ->
                     ok
-            end;
+            end,
+            erlang:garbage_collect(),
+
+            zero_copy_stress(Board),
+            erlang:garbage_collect();
         {error, Reason} ->
             io:format("Failed to auto-detect camera board: ~p~n", [Reason])
     end,
@@ -216,7 +231,9 @@ test_custom_ai_thinker() ->
                             io:format("Triggering flash photo on custom board...~n"),
                             case esp32cam:capture([{flash, on}, {flash_delay_ms, 50}]) of
                                 {ok, FlashImage} ->
-                                    io:format("Captured custom flash image. size=~p bytes~n", [erlang:byte_size(FlashImage)]),
+                                    io:format("Captured custom flash image. size=~p bytes~n", [
+                                        erlang:byte_size(FlashImage)
+                                    ]),
                                     ok;
                                 {error, FlashErr} ->
                                     io:format("Custom flash capture failed: ~p~n", [FlashErr]),
@@ -251,7 +268,9 @@ demo_white_balance_and_warm_up(Board) ->
             io:format("Camera initialized with custom white balance settings.~n"),
             case esp32cam:capture() of
                 {ok, Image} ->
-                    io:format("Captured custom white balance image: ~p bytes~n", [erlang:byte_size(Image)]),
+                    io:format("Captured custom white balance image: ~p bytes~n", [
+                        erlang:byte_size(Image)
+                    ]),
                     ok = term_image:display(Image),
                     ok;
                 {error, Reason} ->
@@ -276,7 +295,9 @@ demo_runtime_controls(Board) ->
             io:format("Camera initialized with initial controls.~n"),
             case esp32cam:capture() of
                 {ok, Image1} ->
-                    io:format("Captured image 1 (brightness=1, hmirror=true): ~p bytes~n", [erlang:byte_size(Image1)]),
+                    io:format("Captured image 1 (brightness=1, hmirror=true): ~p bytes~n", [
+                        erlang:byte_size(Image1)
+                    ]),
                     ok = term_image:display(Image1);
                 {error, Reason1} ->
                     io:format("Failed to capture image 1: ~p~n", [Reason1])
@@ -288,7 +309,9 @@ demo_runtime_controls(Board) ->
 
             case esp32cam:capture() of
                 {ok, Image2} ->
-                    io:format("Captured image 2 (contrast=2, hmirror=false): ~p bytes~n", [erlang:byte_size(Image2)]),
+                    io:format("Captured image 2 (contrast=2, hmirror=false): ~p bytes~n", [
+                        erlang:byte_size(Image2)
+                    ]),
                     ok = term_image:display(Image2);
                 {error, Reason2} ->
                     io:format("Failed to capture image 2: ~p~n", [Reason2])
@@ -303,8 +326,222 @@ demo_runtime_controls(Board) ->
 
 maybe_set_control(Control, Value) ->
     case esp32cam:set_control(Control, Value) of
-        ok -> ok;
+        ok ->
+            ok;
         {error, Reason} ->
             io:format("control ~p=~p unsupported/failed: ~p~n", [Control, Value, Reason]),
             ok
     end.
+
+%% Run this explicitly after the normal demo has identified the board:
+%%
+%%     esp32cam_example:zero_copy_stress(ai_thinker, 1000).
+%%
+%% The test returns {error, Reason} on the first broken lifecycle invariant.
+zero_copy_stress(Board) ->
+    zero_copy_stress(Board, ?DEFAULT_ZERO_COPY_ITERATIONS).
+
+zero_copy_stress(Board, Iterations) when is_integer(Iterations), Iterations > 0 ->
+    io:format("=== Zero-Copy Frame Stress Test (~p iterations) ===~n", [Iterations]),
+    Config = [
+        {board, Board},
+        {frame_size, vga},
+        {jpeg_quality, 12},
+        {fb_count, 2},
+        {fb_location, psram},
+        {grab_mode, latest}
+    ],
+    case esp32cam:init(Config) of
+        ok ->
+            BaselineBinaryMemory = erlang:memory(binary),
+            io:format("Initial binary memory: ~p bytes~n", [BaselineBinaryMemory]),
+            case zero_copy_preflight(Config) of
+                ok ->
+                    case zero_copy_display_burst(1, ?ZERO_COPY_DISPLAY_BURST) of
+                        ok ->
+                            case zero_copy_loop(1, Iterations, BaselineBinaryMemory) of
+                                ok ->
+                                    erlang:garbage_collect(),
+                                    FinalBinaryMemory = erlang:memory(binary),
+                                    io:format(
+                                        "Zero-copy stress passed. binary memory: ~p -> ~p bytes~n",
+                                        [BaselineBinaryMemory, FinalBinaryMemory]
+                                    ),
+                                    ok;
+                                Error ->
+                                    Error
+                            end;
+                        Error ->
+                            Error
+                    end;
+                Error ->
+                    Error
+            end;
+        {error, Reason} ->
+            stress_error(init, Reason)
+    end;
+zero_copy_stress(_Board, Iterations) ->
+    {error, {invalid_iterations, Iterations}}.
+
+zero_copy_preflight(Config) ->
+    case capture_two_frames() of
+        {ok, Frame1, Frame2} ->
+            ThirdCapture = esp32cam:capture_frame(),
+            case ThirdCapture of
+                {error, frames_in_use} ->
+                    case esp32cam:init(Config) of
+                        {error, frames_in_use} ->
+                            release_two_frames(Frame1, Frame2);
+                        OtherInitResult ->
+                            _ = esp32cam:release_frame(Frame1),
+                            _ = esp32cam:release_frame(Frame2),
+                            stress_error(reinit_with_leases, OtherInitResult)
+                    end;
+                OtherCaptureResult ->
+                    _ = esp32cam:release_frame(Frame1),
+                    _ = esp32cam:release_frame(Frame2),
+                    stress_error(lease_limit, OtherCaptureResult)
+            end;
+        Error ->
+            Error
+    end.
+
+capture_two_frames() ->
+    case esp32cam:capture_frame() of
+        {ok, Frame1} ->
+            case esp32cam:capture_frame() of
+                {ok, Frame2} ->
+                    {ok, Frame1, Frame2};
+                {error, Reason} ->
+                    _ = esp32cam:release_frame(Frame1),
+                    stress_error(second_lease, Reason)
+            end;
+        {error, Reason} ->
+            stress_error(first_lease, Reason)
+    end.
+
+release_two_frames(Frame1, Frame2) ->
+    case esp32cam:release_frame(Frame1) of
+        ok ->
+            case esp32cam:release_frame(Frame2) of
+                ok -> ok;
+                {error, Reason} -> stress_error(release_second_lease, Reason)
+            end;
+        {error, Reason} ->
+            _ = esp32cam:release_frame(Frame2),
+            stress_error(release_first_lease, Reason)
+    end.
+
+zero_copy_loop(Iteration, Iterations, _BaselineBinaryMemory) when Iteration > Iterations ->
+    ok;
+zero_copy_loop(Iteration, Iterations, BaselineBinaryMemory) ->
+    case zero_copy_iteration(Iteration) of
+        ok ->
+            case Iteration rem ?ZERO_COPY_PROGRESS_INTERVAL of
+                0 ->
+                    CurrentBinaryMemory = erlang:memory(binary),
+                    io:format(
+                        "zero-copy iteration ~p/~p, binary memory=~p bytes (delta=~p)~n",
+                        [
+                            Iteration,
+                            Iterations,
+                            CurrentBinaryMemory,
+                            CurrentBinaryMemory - BaselineBinaryMemory
+                        ]
+                    );
+                _ ->
+                    ok
+            end,
+            zero_copy_loop(Iteration + 1, Iterations, BaselineBinaryMemory);
+        Error ->
+            Error
+    end.
+
+zero_copy_iteration(Iteration) ->
+    case esp32cam:capture_frame() of
+        {ok, Frame} ->
+            case esp32cam:frame_info(Frame) of
+                {ok, #{size := Size}} when is_integer(Size), Size > 0 ->
+                    case inspect_live_binary_view(Frame, Size) of
+                        ok ->
+                            erlang:garbage_collect(),
+                            case esp32cam:release_frame(Frame) of
+                                ok ->
+                                    maybe_test_gc_fallback(Iteration);
+                                {error, Reason} ->
+                                    stress_error({release_after_view_gc, Iteration}, Reason)
+                            end;
+                        Error ->
+                            Error
+                    end;
+                OtherInfoResult ->
+                    _ = esp32cam:release_frame(Frame),
+                    stress_error({frame_info, Iteration}, OtherInfoResult)
+            end;
+        {error, Reason} ->
+            stress_error({capture, Iteration}, Reason)
+    end.
+
+zero_copy_display_burst(Index, Count) when Index > Count ->
+    ok;
+zero_copy_display_burst(Index, Count) ->
+    case esp32cam:capture_frame() of
+        {ok, Frame} ->
+            io:format("Displaying zero-copy frame ~p/~p...~n", [Index, Count]),
+            DisplayResult = term_image:display(Frame),
+            ReleaseResult = esp32cam:release_frame(Frame),
+            case {DisplayResult, ReleaseResult} of
+                {ok, ok} ->
+                    zero_copy_display_burst(Index + 1, Count);
+                {{error, Reason}, _} ->
+                    stress_error({display_burst, Index}, Reason);
+                {ok, {error, Reason}} ->
+                    stress_error({display_burst_release, Index}, Reason)
+            end;
+        {error, Reason} ->
+            stress_error({display_burst_capture, Index}, Reason)
+    end.
+
+inspect_live_binary_view(Frame, ExpectedSize) ->
+    case esp32cam:frame_binary(Frame) of
+        {ok, Binary} when is_binary(Binary), byte_size(Binary) =:= ExpectedSize ->
+            case esp32cam:release_frame(Frame) of
+                {error, binary_views_active} ->
+                    ok;
+                OtherReleaseResult ->
+                    stress_error(release_with_live_binary, OtherReleaseResult)
+            end;
+        {ok, Binary} when is_binary(Binary) ->
+            stress_error(binary_size, {expected, ExpectedSize, got, byte_size(Binary)});
+        OtherBinaryResult ->
+            stress_error(frame_binary, OtherBinaryResult)
+    end.
+
+maybe_test_gc_fallback(Iteration) when Iteration rem ?ZERO_COPY_PROGRESS_INTERVAL =:= 0 ->
+    case capture_and_drop_two_frames() of
+        ok ->
+            erlang:garbage_collect(),
+            case capture_two_frames() of
+                {ok, Frame1, Frame2} ->
+                    release_two_frames(Frame1, Frame2);
+                Error ->
+                    stress_error({gc_fallback, Iteration}, Error)
+            end;
+        Error ->
+            stress_error({gc_fallback_setup, Iteration}, Error)
+    end;
+maybe_test_gc_fallback(_Iteration) ->
+    ok.
+
+capture_and_drop_two_frames() ->
+    case capture_two_frames() of
+        {ok, _Frame1, _Frame2} ->
+            ok;
+        Error ->
+            Error
+    end.
+
+stress_error(Stage, Reason) ->
+    Error = {error, {zero_copy_stress, Stage, Reason}},
+    io:format("Zero-copy stress failed: ~p~n", [Error]),
+    Error.

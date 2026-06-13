@@ -56,6 +56,19 @@ esp32cam_test_() ->
             ]},
             {"Terminal Image Tests", [
                 fun test_display_iterm2/0
+            ]},
+            {"Zero-Copy Frame Tests", [
+                fun test_capture_frame_basic/0,
+                fun test_frame_info/0,
+                fun test_release_frame/0,
+                fun test_view_active_release_rejection/0,
+                fun test_lease_limits/0,
+                fun test_reinit_lease_rejection/0,
+                fun test_destructor_returns_fb/0
+            ]},
+            {"PSRAM and Framebuffer Auto-Resolution Tests", [
+                fun test_psram_size/0,
+                fun test_fb_count_auto_resolution/0
             ]}
         ]}}.
 
@@ -489,6 +502,198 @@ test_display_iterm2() ->
         ?assertEqual(ok, Result),
         ?assertEqual({error, badarg}, term_image:display(not_a_binary)),
         ?assertEqual({error, too_large}, term_image:display(binary:copy(<<0>>, 262145)))
+    end).
+
+%%====================================================================
+%% Zero-Copy Frame Tests
+%%====================================================================
+
+test_capture_frame_basic() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        Result = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        ?assertMatch({ok, {mock_frame, _}}, Result),
+        {ok, Frame} = Result,
+
+        ResultBin = safe_call(fun() -> esp32cam_mock:frame_binary(Frame) end),
+        ?assertMatch({ok, Bin} when is_binary(Bin), ResultBin),
+        {ok, Bin} = ResultBin,
+        ?assertEqual(?MOCK_IMAGE_DATA, Bin),
+
+        % Clean up
+        ok = safe_call(fun() -> esp32cam_mock:collect_binary_view(Frame) end),
+        ok = safe_call(fun() -> esp32cam_mock:release_frame(Frame) end)
+    end).
+
+test_frame_info() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        {ok, Frame} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        InfoResult = safe_call(fun() -> esp32cam_mock:frame_info(Frame) end),
+        ?assertMatch(
+            {ok, #{size := _, width := _, height := _, pixel_format := _, timestamp := _}},
+            InfoResult
+        ),
+        {ok, Info} = InfoResult,
+        ?assertEqual(byte_size(?MOCK_IMAGE_DATA), maps:get(size, Info)),
+        ?assertEqual(1024, maps:get(width, Info)),
+        ?assertEqual(768, maps:get(height, Info)),
+        ?assertEqual(jpeg, maps:get(pixel_format, Info)),
+        ?assertEqual({1700, 0, 0}, maps:get(timestamp, Info)),
+
+        ok = safe_call(fun() -> esp32cam_mock:release_frame(Frame) end)
+    end).
+
+test_release_frame() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        {ok, Frame} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        ?assertEqual(ok, safe_call(fun() -> esp32cam_mock:release_frame(Frame) end)),
+        % Idempotent rejection check
+        ?assertEqual(
+            {error, already_released}, safe_call(fun() -> esp32cam_mock:release_frame(Frame) end)
+        ),
+        ?assertEqual(
+            {error, already_released}, safe_call(fun() -> esp32cam_mock:frame_binary(Frame) end)
+        ),
+        ?assertEqual(
+            {error, already_released}, safe_call(fun() -> esp32cam_mock:frame_info(Frame) end)
+        )
+    end).
+
+test_view_active_release_rejection() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        {ok, Frame} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        {ok, Bin} = safe_call(fun() -> esp32cam_mock:frame_binary(Frame) end),
+        ?assert(is_binary(Bin)),
+        % Should fail to release while view is active
+        ?assertEqual(
+            {error, binary_views_active}, safe_call(fun() -> esp32cam_mock:release_frame(Frame) end)
+        ),
+        % Collect the view
+        ok = safe_call(fun() -> esp32cam_mock:collect_binary_view(Frame) end),
+        % Now release should succeed
+        ?assertEqual(ok, safe_call(fun() -> esp32cam_mock:release_frame(Frame) end))
+    end).
+
+test_lease_limits() ->
+    ?_test(begin
+        % Initialize with fb_count = 1
+        ok = safe_call(fun() -> esp32cam_mock:init([{fb_count, 1}]) end),
+        {ok, Frame1} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        % Second capture should fail immediately
+        ?assertEqual({error, frames_in_use}, safe_call(fun() -> esp32cam_mock:capture_frame() end)),
+        % Release first frame
+        ok = safe_call(fun() -> esp32cam_mock:release_frame(Frame1) end),
+        % Now second capture should succeed
+        {ok, Frame2} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        ok = safe_call(fun() -> esp32cam_mock:release_frame(Frame2) end)
+    end).
+
+test_reinit_lease_rejection() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init([{fb_count, 1}]) end),
+        {ok, Frame} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        % Reinit should fail with outstanding lease
+        ?assertEqual({error, frames_in_use}, safe_call(fun() -> esp32cam_mock:init() end)),
+        % Release outstanding lease
+        ok = safe_call(fun() -> esp32cam_mock:release_frame(Frame) end),
+        % Reinit should now succeed
+        ?assertEqual(ok, safe_call(fun() -> esp32cam_mock:init() end))
+    end).
+
+test_destructor_returns_fb() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init([{fb_count, 1}]) end),
+        {ok, Frame} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        % outstanding leases is now 1. capture fails.
+        ?assertEqual({error, frames_in_use}, safe_call(fun() -> esp32cam_mock:capture_frame() end)),
+        % Simulate GC collection of Frame (destructor)
+        ok = safe_call(fun() -> esp32cam_mock:collect_frame(Frame) end),
+        % Now capture should succeed
+        {ok, Frame2} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        ok = safe_call(fun() -> esp32cam_mock:release_frame(Frame2) end)
+    end).
+
+test_psram_size() ->
+    ?_test(begin
+        % Test default mocked size
+        ?assertEqual(4194304, esp32cam_mock:psram_size()),
+        % Test custom mocked size
+        put(esp32cam_mock_psram_size, 8388608),
+        ?assertEqual(8388608, esp32cam_mock:psram_size()),
+        put(esp32cam_mock_psram_size, 0),
+        ?assertEqual(0, esp32cam_mock:psram_size()),
+        % Clean up
+        erase(esp32cam_mock_psram_size)
+    end).
+
+test_fb_count_auto_resolution() ->
+    ?_test(begin
+        % Test when no PSRAM is present (mock size = 0)
+        put(esp32cam_mock_psram_size, 0),
+        ?assertEqual(1, esp32cam:resolve_fb_count(auto, [{fb_location, psram}])),
+
+        % Test when fb_location = dram
+        put(esp32cam_mock_psram_size, 4194304),
+        ?assertEqual(1, esp32cam:resolve_fb_count(auto, [{fb_location, dram}])),
+
+        % Test when PSRAM is present (4MB) and format is JPEG, small resolution (VGA)
+        ?assertEqual(
+            3,
+            esp32cam:resolve_fb_count(auto, [
+                {fb_location, psram}, {frame_size, vga}, {pixel_format, jpeg}
+            ])
+        ),
+
+        % Test when PSRAM is present (4MB) and format is JPEG, medium resolution (XGA)
+        ?assertEqual(
+            3,
+            esp32cam:resolve_fb_count(auto, [
+                {fb_location, psram}, {frame_size, xga}, {pixel_format, jpeg}
+            ])
+        ),
+
+        % Test when PSRAM is present (4MB) and format is JPEG, huge resolution (5mp)
+        ?assertEqual(
+            2,
+            esp32cam:resolve_fb_count(auto, [
+                {fb_location, psram}, {frame_size, '5mp'}, {pixel_format, jpeg}
+            ])
+        ),
+
+        % Test when PSRAM is present (4MB) and format is raw (RGB565) and resolution is VGA
+        ?assertEqual(
+            1,
+            esp32cam:resolve_fb_count(auto, [
+                {fb_location, psram}, {frame_size, vga}, {pixel_format, rgb565}
+            ])
+        ),
+
+        % Test when PSRAM is present (8MB) and format is raw (RGB565) and resolution is VGA
+        put(esp32cam_mock_psram_size, 8388608),
+        ?assertEqual(
+            3,
+            esp32cam:resolve_fb_count(auto, [
+                {fb_location, psram}, {frame_size, vga}, {pixel_format, rgb565}
+            ])
+        ),
+
+        % Test when PSRAM is present (4MB) and format is raw (RGB565) and resolution is QQVGA
+        put(esp32cam_mock_psram_size, 4194304),
+        ?assertEqual(
+            3,
+            esp32cam:resolve_fb_count(auto, [
+                {fb_location, psram}, {frame_size, qqvga}, {pixel_format, rgb565}
+            ])
+        ),
+
+        % Test explicit fb_count overrides are respected
+        ?assertEqual(5, esp32cam:resolve_fb_count(5, [])),
+
+        % Clean up
+        erase(esp32cam_mock_psram_size)
     end).
 
 %%====================================================================
