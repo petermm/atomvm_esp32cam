@@ -15,6 +15,8 @@
     frame_info/1,
     release_frame/1,
     psram_size/0,
+    set_psram_mode/1,
+    get_psram_mode/0,
     collect_binary_view/1,
     collect_frame/1,
     start_mock_mode/0,
@@ -264,6 +266,34 @@ psram_size() ->
             catch
                 throw:nif_error -> mock_psram_size();
                 _:_ -> mock_psram_size()
+            end
+    end.
+
+set_psram_mode(Enable) when is_boolean(Enable) ->
+    case is_mock_mode() of
+        true ->
+            mock_set_psram_mode(Enable);
+        false ->
+            try
+                esp32cam:set_psram_mode(Enable)
+            catch
+                throw:nif_error -> mock_set_psram_mode(Enable);
+                _:_ -> mock_set_psram_mode(Enable)
+            end
+    end;
+set_psram_mode(_) ->
+    {error, badarg}.
+
+get_psram_mode() ->
+    case is_mock_mode() of
+        true ->
+            mock_get_psram_mode();
+        false ->
+            try
+                esp32cam:get_psram_mode()
+            catch
+                throw:nif_error -> mock_get_psram_mode();
+                _:_ -> mock_get_psram_mode()
             end
     end.
 
@@ -686,6 +716,36 @@ mock_psram_size() ->
     case get(esp32cam_mock_psram_size) of
         undefined -> 4194304;
         Size -> Size
+    end.
+
+mock_set_psram_mode(Enable) ->
+    case get(esp32cam_current_board) of
+        undefined ->
+            {error, bad_state};
+        _ ->
+            case get(esp32cam_mock_outstanding_leases) of
+                Leases when is_integer(Leases), Leases > 0 ->
+                    {error, frames_in_use};
+                _ ->
+                    case get(?MOCK_BEHAVIOR_KEY) of
+                        always_error ->
+                            {error, mock_control_failed};
+                        _ ->
+                            put(esp32cam_mock_psram_dma_mode, Enable),
+                            ok
+                    end
+            end
+    end.
+
+mock_get_psram_mode() ->
+    case get(esp32cam_current_board) of
+        undefined ->
+            {error, bad_state};
+        _ ->
+            case get(esp32cam_mock_psram_dma_mode) of
+                undefined -> false;
+                Mode -> Mode
+            end
     end.
 
 %%-----------------------------------------------------------------------------

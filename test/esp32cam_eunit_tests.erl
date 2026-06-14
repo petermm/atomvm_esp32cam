@@ -68,6 +68,7 @@ esp32cam_test_() ->
             ]},
             {"PSRAM and Framebuffer Auto-Resolution Tests", [
                 fun test_psram_size/0,
+                fun test_psram_dma_mode/0,
                 fun test_fb_count_auto_resolution/0
             ]}
         ]}}.
@@ -627,6 +628,36 @@ test_psram_size() ->
         ?assertEqual(0, esp32cam_mock:psram_size()),
         % Clean up
         erase(esp32cam_mock_psram_size)
+    end).
+
+test_psram_dma_mode() ->
+    ?_test(begin
+        % 1. Before init, get and set should return {error, bad_state}
+        erase(esp32cam_current_board),
+        ?assertEqual({error, bad_state}, esp32cam_mock:get_psram_mode()),
+        ?assertEqual({error, bad_state}, esp32cam_mock:set_psram_mode(true)),
+
+        % 2. Initialize
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        % Default is false
+        ?assertEqual(false, esp32cam_mock:get_psram_mode()),
+
+        % 3. Set and get
+        ?assertEqual(ok, esp32cam_mock:set_psram_mode(true)),
+        ?assertEqual(true, esp32cam_mock:get_psram_mode()),
+        ?assertEqual(ok, esp32cam_mock:set_psram_mode(false)),
+        ?assertEqual(false, esp32cam_mock:get_psram_mode()),
+
+        % 4. Validate badarg type check
+        ?assertEqual({error, badarg}, esp32cam_mock:set_psram_mode(not_a_boolean)),
+
+        % 5. Test active frame leases guard
+        {ok, Frame} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        ?assertEqual({error, frames_in_use}, esp32cam_mock:set_psram_mode(true)),
+        ok = safe_call(fun() -> esp32cam_mock:release_frame(Frame) end),
+
+        % 6. After releasing, it should work again
+        ?assertEqual(ok, esp32cam_mock:set_psram_mode(true))
     end).
 
 test_fb_count_auto_resolution() ->

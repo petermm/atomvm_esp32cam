@@ -38,6 +38,10 @@
     get_board_info_nif/0,
     psram_size/0,
     psram_size_nif/0,
+    set_psram_mode/1,
+    set_psram_mode_nif/1,
+    get_psram_mode/0,
+    get_psram_mode_nif/0,
     resolve_fb_count/2
 ]).
 
@@ -695,6 +699,33 @@ psram_size() ->
     end.
 
 psram_size_nif() ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
+%% @param   Enable boolean flag indicating whether PSRAM DMA mode should be enabled.
+%% @returns `ok' or `{error, Reason}'
+%% @doc     Enable or disable PSRAM DMA mode at runtime.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec set_psram_mode(boolean()) -> ok | {error, term()}.
+set_psram_mode(Enable) when is_boolean(Enable) ->
+    esp32cam:set_psram_mode_nif(Enable);
+set_psram_mode(_) ->
+    {error, badarg}.
+
+set_psram_mode_nif(_Enable) ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
+%% @returns `true' or `false'
+%% @doc     Query whether PSRAM DMA mode is currently enabled.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec get_psram_mode() -> boolean().
+get_psram_mode() ->
+    esp32cam:get_psram_mode_nif().
+
+get_psram_mode_nif() ->
     throw(nif_error).
 
 %%-----------------------------------------------------------------------------

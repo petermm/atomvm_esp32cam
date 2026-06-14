@@ -1684,6 +1684,71 @@ static term nif_esp32cam_psram_size(Context *ctx, int argc, term argv[])
     return term_from_int(total_psram);
 }
 
+static term nif_esp32cam_set_psram_mode_locked(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    if (!camera_initialized) {
+        ESP_LOGE(TAG, "Camera not initialized! Call esp32cam:init() first.");
+        RAISE_ERROR(globalcontext_make_atom(ctx->global, bad_state_a));
+    }
+    if (outstanding_leases > 0) {
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, frames_in_use_a));
+    }
+
+    term enable_term = argv[0];
+    if (enable_term != TRUE_ATOM && enable_term != FALSE_ATOM) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+    bool enable = (enable_term == TRUE_ATOM);
+
+    esp_err_t err = esp_camera_set_psram_mode(enable);
+    if (UNLIKELY(err != ESP_OK)) {
+        camera_initialized = 0;
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, term_from_int28(err));
+    }
+    return OK_ATOM;
+}
+
+static term nif_esp32cam_set_psram_mode(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_set_psram_mode_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_get_psram_mode_locked(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    UNUSED(argv);
+    if (!camera_initialized) {
+        ESP_LOGE(TAG, "Camera not initialized! Call esp32cam:init() first.");
+        RAISE_ERROR(globalcontext_make_atom(ctx->global, bad_state_a));
+    }
+
+    bool mode = esp_camera_get_psram_mode();
+    return mode ? TRUE_ATOM : FALSE_ATOM;
+}
+
+static term nif_esp32cam_get_psram_mode(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_get_psram_mode_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
 static term pixformat_to_term(pixformat_t format, Context *ctx)
 {
     switch (format) {
@@ -2054,6 +2119,14 @@ static const struct Nif esp32cam_psram_size_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_esp32cam_psram_size
 };
+static const struct Nif esp32cam_set_psram_mode_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_esp32cam_set_psram_mode
+};
+static const struct Nif esp32cam_get_psram_mode_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_esp32cam_get_psram_mode
+};
 static const struct Nif term_image_display_frame_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_term_image_display_frame
@@ -2117,6 +2190,14 @@ const struct Nif *atomvm_esp32cam_get_nif(const char *nifname)
     if (strcmp("esp32cam:psram_size_nif/0", nifname) == 0) {
         TRACE("Resolved platform nif %s ...\n", nifname);
         return &esp32cam_psram_size_nif;
+    }
+    if (strcmp("esp32cam:set_psram_mode_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_set_psram_mode_nif;
+    }
+    if (strcmp("esp32cam:get_psram_mode_nif/0", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_get_psram_mode_nif;
     }
     if (strcmp("term_image:display_frame_nif/1", nifname) == 0) {
         TRACE("Resolved platform nif %s ...\n", nifname);

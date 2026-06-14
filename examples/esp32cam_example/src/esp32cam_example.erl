@@ -22,7 +22,8 @@
     demo_white_balance_and_warm_up/1,
     demo_runtime_controls/1,
     zero_copy_stress/1,
-    zero_copy_stress/2
+    zero_copy_stress/2,
+    zero_copy_stress/3
 ]).
 
 -define(DEFAULT_ZERO_COPY_ITERATIONS, 100).
@@ -66,7 +67,15 @@ start() ->
             erlang:garbage_collect(),
 
             zero_copy_stress(Board),
-            erlang:garbage_collect();
+            erlang:garbage_collect(),
+
+            case is_esp32s3(Board) of
+                true ->
+                    zero_copy_stress(Board, ?DEFAULT_ZERO_COPY_ITERATIONS, true),
+                    erlang:garbage_collect();
+                false ->
+                    ok
+            end;
         {error, Reason} ->
             io:format("Failed to auto-detect camera board: ~p~n", [Reason])
     end,
@@ -339,10 +348,13 @@ maybe_set_control(Control, Value) ->
 %%
 %% The test returns {error, Reason} on the first broken lifecycle invariant.
 zero_copy_stress(Board) ->
-    zero_copy_stress(Board, ?DEFAULT_ZERO_COPY_ITERATIONS).
+    zero_copy_stress(Board, ?DEFAULT_ZERO_COPY_ITERATIONS, false).
 
-zero_copy_stress(Board, Iterations) when is_integer(Iterations), Iterations > 0 ->
-    io:format("=== Zero-Copy Frame Stress Test (~p iterations) ===~n", [Iterations]),
+zero_copy_stress(Board, Iterations) ->
+    zero_copy_stress(Board, Iterations, false).
+
+zero_copy_stress(Board, Iterations, EnableDMA) when is_integer(Iterations), Iterations > 0 ->
+    io:format("=== Zero-Copy Frame Stress Test (~p iterations, DMA: ~p) ===~n", [Iterations, EnableDMA]),
     Config = [
         {board, Board},
         {frame_size, vga},
@@ -353,34 +365,53 @@ zero_copy_stress(Board, Iterations) when is_integer(Iterations), Iterations > 0 
     ],
     case esp32cam:init(Config) of
         ok ->
-            BaselineBinaryMemory = erlang:memory(binary),
-            io:format("Initial binary memory: ~p bytes~n", [BaselineBinaryMemory]),
-            case zero_copy_preflight(Config) of
+            PriorMode = esp32cam:get_psram_mode(),
+            MaybeEnableDMA = case EnableDMA of
+                true ->
+                    io:format("Enabling PSRAM DMA mode for stress test...~n"),
+                    esp32cam:set_psram_mode(true);
+                false ->
+                    ok
+            end,
+            Result = case MaybeEnableDMA of
                 ok ->
-                    case zero_copy_display_burst(1, ?ZERO_COPY_DISPLAY_BURST) of
+                    BaselineBinaryMemory = erlang:memory(binary),
+                    io:format("Initial binary memory: ~p bytes~n", [BaselineBinaryMemory]),
+                    case zero_copy_preflight(Config) of
                         ok ->
-                            case zero_copy_loop(1, Iterations, BaselineBinaryMemory) of
+                            case zero_copy_display_burst(1, ?ZERO_COPY_DISPLAY_BURST) of
                                 ok ->
-                                    erlang:garbage_collect(),
-                                    FinalBinaryMemory = erlang:memory(binary),
-                                    io:format(
-                                        "Zero-copy stress passed. binary memory: ~p -> ~p bytes~n",
-                                        [BaselineBinaryMemory, FinalBinaryMemory]
-                                    ),
-                                    ok;
+                                    case zero_copy_loop(1, Iterations, BaselineBinaryMemory) of
+                                        ok ->
+                                            erlang:garbage_collect(),
+                                            FinalBinaryMemory = erlang:memory(binary),
+                                            io:format(
+                                                "Zero-copy stress passed. binary memory: ~p -> ~p bytes~n",
+                                                [BaselineBinaryMemory, FinalBinaryMemory]
+                                            ),
+                                            ok;
+                                        Error ->
+                                            Error
+                                    end;
                                 Error ->
                                     Error
                             end;
                         Error ->
                             Error
                     end;
-                Error ->
-                    Error
-            end;
+                {error, Reason} ->
+                    stress_error(enable_psram_dma, Reason)
+            end,
+            case esp32cam:set_psram_mode(PriorMode) of
+                ok -> ok;
+                {error, RestoreError} ->
+                    io:format("Failed to restore PSRAM DMA mode to ~p: ~p~n", [PriorMode, RestoreError])
+            end,
+            Result;
         {error, Reason} ->
             stress_error(init, Reason)
     end;
-zero_copy_stress(_Board, Iterations) ->
+zero_copy_stress(_Board, Iterations, _EnableDMA) ->
     {error, {invalid_iterations, Iterations}}.
 
 zero_copy_preflight(Config) ->
@@ -545,3 +576,8 @@ stress_error(Stage, Reason) ->
     Error = {error, {zero_copy_stress, Stage, Reason}},
     io:format("Zero-copy stress failed: ~p~n", [Error]),
     Error.
+
+is_esp32s3(esp32s3_wroom) -> true;
+is_esp32s3(esp32s3_goouuu) -> true;
+is_esp32s3(esp32s3_xiao) -> true;
+is_esp32s3(_) -> false.
