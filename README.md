@@ -50,6 +50,39 @@ ok = esp32cam:init(Config),
 {ok, Image} = esp32cam:capture([{flash, on}, {flash_delay_ms, 100}]).
 ```
 
+### 3. Autofocus Control (OV5640 Sensors)
+Autofocus requires an OV5640 module with an autofocus lens, `esp32-camera >= 2.1.5`,
+and `CONFIG_OV5640_SUPPORT=y` plus `CONFIG_CAMERA_AF_SUPPORT=y` in the firmware configuration.
+AF is **disabled by default** in `sdkconfig.defaults.esp32cam` to save flash.
+With AF disabled, all AF NIFs return `{error, unsupported}`. With AF enabled,
+`af_init/1` returns `{error, unsupported}` for non-AF sensors such as OV2640.
+
+```erlang
+% Initialize autofocus config
+ok = esp32cam:af_init([{mode, auto}, {timeout_ms, 2000}]),
+
+% Trigger focusing
+ok = esp32cam:af_trigger(),
+
+% Wait for completion, then verify that focus was actually achieved.
+% af_wait/1 can return {ok, Status} with focused => false.
+{ok, #{busy := false, focused := true}} = esp32cam:af_wait(2000),
+
+% Capture image now that it's focused!
+{ok, Image} = esp32cam:capture().
+```
+
+With AF enabled, operations before successful `af_init/1` return `{error, bad_state}`.
+Reinitializing the camera or setting PSRAM DMA mode (even to the current value)
+requires another `af_init/1`. A failed driver-level AF initialization also invalidates AF readiness.
+
+Timeouts are unsigned 32-bit milliseconds. `af_wait(0)` uses the configured timeout;
+initializing AF with `timeout_ms = 0` keeps the driver's previous timeout (initially 2000 ms).
+Range and step values are unsigned 16-bit integers, with `range_min =< range_max`.
+Both range endpoints default to zero, so a nonzero minimum requires an explicit maximum.
+The v2.1.5 driver does not apply range/step settings, and its OV5640 manual-position
+callback is unimplemented: `af_set_manual_position/1` returns `{error, -1}` (`ESP_FAIL`).
+
 ---
 
 ## Documentation

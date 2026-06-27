@@ -21,6 +21,7 @@
 #include <driver/gpio.h>
 #include <esp32_sys.h>
 #include <esp_camera.h>
+#include <esp_camera_af.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <interop.h>
@@ -425,6 +426,28 @@ static const board_config_t board_configs[] = {
         .name = "ESP-EYE" }
 };
 
+#if defined(CONFIG_CAMERA_AF_SUPPORT) && CONFIG_CAMERA_AF_SUPPORT
+static const char *const manual_a = "\x6"
+                                    "manual";
+static const char *const step_size_a = "\x9"
+                                       "step_size";
+static const char *const range_min_a = "\x9"
+                                       "range_min";
+static const char *const range_max_a = "\x9"
+                                       "range_max";
+static const char *const timeout_ms_a = "\xA"
+                                        "timeout_ms";
+static const char *const focused_a = "\x7"
+                                     "focused";
+static const char *const busy_a = "\x4"
+                                  "busy";
+static const char *const mode_a = "\x4"
+                                  "mode";
+#endif
+
+static const char *const unsupported_a = "\xB"
+                                         "unsupported";
+
 static const char *const frame_size_a = "\xA"
                                         "frame_size";
 static const char *const jpeg_quality_a = "\xC"
@@ -670,6 +693,7 @@ static const char *const io_error_a = "\x8"
 //                                                    123456789ABCDEF
 
 uint8_t camera_initialized = 0;
+uint8_t camera_af_initialized = 0;
 board_type_t initialized_board_type = BOARD_INVALID;
 int initialized_flash_pin = -1;
 int initialized_xclk_pin = -1;
@@ -677,6 +701,7 @@ int initialized_xclk_pin = -1;
 static void deinit_camera_and_reset_xclk(int pin_xclk)
 {
     esp_camera_deinit();
+    camera_af_initialized = 0;
     if (pin_xclk >= 0) {
         gpio_reset_pin(pin_xclk);
     }
@@ -1029,6 +1054,84 @@ static bool is_valid_output_gpio(int pin)
 {
     return GPIO_IS_VALID_OUTPUT_GPIO(pin);
 }
+
+#if defined(CONFIG_CAMERA_AF_SUPPORT) && CONFIG_CAMERA_AF_SUPPORT
+static bool get_uint16_arg(term t, uint16_t *out)
+{
+    if (!term_is_uint32(t)) {
+        return false;
+    }
+    uint32_t v = term_to_uint32(t);
+    if (v > UINT16_MAX) {
+        return false;
+    }
+    *out = (uint16_t) v;
+    return true;
+}
+
+static bool get_uint32_arg(term t, uint32_t *out)
+{
+    if (!term_is_uint32(t)) {
+        return false;
+    }
+    *out = term_to_uint32(t);
+    return true;
+}
+
+static bool parse_af_config(Context *ctx, term config, esp_camera_af_config_t *out_config)
+{
+    out_config->mode = ESP_CAMERA_AF_MODE_AUTO;
+    out_config->step_size = 0;
+    out_config->range_min = 0;
+    out_config->range_max = 0;
+    out_config->timeout_ms = 0;
+
+    term mode_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, mode_a));
+    if (!term_is_nil(mode_term)) {
+        if (mode_term == globalcontext_make_atom(ctx->global, auto_a)) {
+            out_config->mode = ESP_CAMERA_AF_MODE_AUTO;
+        } else if (mode_term == globalcontext_make_atom(ctx->global, manual_a)) {
+            out_config->mode = ESP_CAMERA_AF_MODE_MANUAL;
+        } else {
+            return false;
+        }
+    }
+
+    term step_size_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, step_size_a));
+    if (!term_is_nil(step_size_term)) {
+        if (!get_uint16_arg(step_size_term, &out_config->step_size)) {
+            return false;
+        }
+    }
+
+    term range_min_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, range_min_a));
+    if (!term_is_nil(range_min_term)) {
+        if (!get_uint16_arg(range_min_term, &out_config->range_min)) {
+            return false;
+        }
+    }
+
+    term range_max_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, range_max_a));
+    if (!term_is_nil(range_max_term)) {
+        if (!get_uint16_arg(range_max_term, &out_config->range_max)) {
+            return false;
+        }
+    }
+
+    term timeout_ms_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, timeout_ms_a));
+    if (!term_is_nil(timeout_ms_term)) {
+        if (!get_uint32_arg(timeout_ms_term, &out_config->timeout_ms)) {
+            return false;
+        }
+    }
+
+    if (out_config->range_min > out_config->range_max) {
+        return false;
+    }
+
+    return true;
+}
+#endif
 
 static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
 {
@@ -1620,6 +1723,370 @@ static term nif_esp32cam_set_control(Context *ctx, int argc, term argv[])
     return result;
 }
 
+#if defined(CONFIG_CAMERA_AF_SUPPORT) && CONFIG_CAMERA_AF_SUPPORT
+static term nif_esp32cam_af_init_locked(Context *ctx, int argc, term argv[])
+{
+    if (argc != 1) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+    if (!camera_initialized) {
+        ESP_LOGE(TAG, "Camera not initialized! Call esp32cam:init() first.");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, bad_state_a));
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s == NULL) {
+        ESP_LOGE(TAG, "Could not get sensor pointer");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, term_from_int28(ESP_FAIL));
+    }
+
+    if (!esp_camera_af_is_supported(s)) {
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
+    }
+
+    term config = argv[0];
+    VALIDATE_VALUE(config, term_is_list);
+
+    esp_camera_af_config_t af_config;
+    if (!parse_af_config(ctx, config, &af_config)) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    camera_af_initialized = 0;
+    esp_err_t err = esp_camera_af_init(s, &af_config);
+    if (err != ESP_OK) {
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
+        }
+        return port_create_error_tuple(ctx, term_from_int28(err));
+    }
+
+    camera_af_initialized = 1;
+    return OK_ATOM;
+}
+
+static term nif_esp32cam_af_init(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_af_init_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_af_set_mode_locked(Context *ctx, int argc, term argv[])
+{
+    if (argc != 1) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+    if (!camera_af_initialized) {
+        ESP_LOGE(TAG, "Autofocus not initialized! Call esp32cam:af_init() first.");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, bad_state_a));
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s == NULL) {
+        ESP_LOGE(TAG, "Could not get sensor pointer");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, term_from_int28(ESP_FAIL));
+    }
+
+    term mode_term = argv[0];
+    esp_camera_af_mode_t mode;
+    if (mode_term == globalcontext_make_atom(ctx->global, auto_a)) {
+        mode = ESP_CAMERA_AF_MODE_AUTO;
+    } else if (mode_term == globalcontext_make_atom(ctx->global, manual_a)) {
+        mode = ESP_CAMERA_AF_MODE_MANUAL;
+    } else {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    esp_err_t err = esp_camera_af_set_mode(s, mode);
+    if (err != ESP_OK) {
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
+        }
+        return port_create_error_tuple(ctx, term_from_int28(err));
+    }
+
+    return OK_ATOM;
+}
+
+static term nif_esp32cam_af_set_mode(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_af_set_mode_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_af_trigger_locked(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    if (!camera_af_initialized) {
+        ESP_LOGE(TAG, "Autofocus not initialized! Call esp32cam:af_init() first.");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, bad_state_a));
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s == NULL) {
+        ESP_LOGE(TAG, "Could not get sensor pointer");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, term_from_int28(ESP_FAIL));
+    }
+
+    esp_err_t err = esp_camera_af_trigger(s);
+    if (err != ESP_OK) {
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
+        }
+        return port_create_error_tuple(ctx, term_from_int28(err));
+    }
+
+    return OK_ATOM;
+}
+
+static term nif_esp32cam_af_trigger(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_af_trigger_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_af_get_status_locked(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    UNUSED(argv);
+
+    if (!camera_af_initialized) {
+        ESP_LOGE(TAG, "Autofocus not initialized! Call esp32cam:af_init() first.");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, bad_state_a));
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s == NULL) {
+        ESP_LOGE(TAG, "Could not get sensor pointer");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, term_from_int28(ESP_FAIL));
+    }
+
+    esp_camera_af_status_t status;
+    esp_err_t err = esp_camera_af_get_status(s, &status);
+    if (err != ESP_OK) {
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
+        }
+        return port_create_error_tuple(ctx, term_from_int28(err));
+    }
+
+    if (UNLIKELY(memory_ensure_free(ctx, 32) != MEMORY_GC_OK)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    term map = term_alloc_map(3, &ctx->heap);
+    term_set_map_assoc(map, 0, globalcontext_make_atom(ctx->global, raw_a), term_from_int(status.raw));
+    term_set_map_assoc(map, 1, globalcontext_make_atom(ctx->global, focused_a), status.focused ? TRUE_ATOM : FALSE_ATOM);
+    term_set_map_assoc(map, 2, globalcontext_make_atom(ctx->global, busy_a), status.busy ? TRUE_ATOM : FALSE_ATOM);
+
+    return port_create_tuple2(ctx, OK_ATOM, map);
+}
+
+static term nif_esp32cam_af_get_status(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_af_get_status_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_af_wait_locked(Context *ctx, int argc, term argv[])
+{
+    if (argc != 1) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+    if (!camera_af_initialized) {
+        ESP_LOGE(TAG, "Autofocus not initialized! Call esp32cam:af_init() first.");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, bad_state_a));
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s == NULL) {
+        ESP_LOGE(TAG, "Could not get sensor pointer");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, term_from_int28(ESP_FAIL));
+    }
+
+    term timeout_term = argv[0];
+    uint32_t timeout_ms;
+    if (!get_uint32_arg(timeout_term, &timeout_ms)) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    esp_camera_af_status_t status;
+    esp_err_t err = esp_camera_af_wait(s, timeout_ms, &status);
+    if (err != ESP_OK) {
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
+        }
+        return port_create_error_tuple(ctx, term_from_int28(err));
+    }
+
+    if (UNLIKELY(memory_ensure_free(ctx, 32) != MEMORY_GC_OK)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    term map = term_alloc_map(3, &ctx->heap);
+    term_set_map_assoc(map, 0, globalcontext_make_atom(ctx->global, raw_a), term_from_int(status.raw));
+    term_set_map_assoc(map, 1, globalcontext_make_atom(ctx->global, focused_a), status.focused ? TRUE_ATOM : FALSE_ATOM);
+    term_set_map_assoc(map, 2, globalcontext_make_atom(ctx->global, busy_a), status.busy ? TRUE_ATOM : FALSE_ATOM);
+
+    return port_create_tuple2(ctx, OK_ATOM, map);
+}
+
+static term nif_esp32cam_af_wait(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_af_wait_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_af_set_manual_position_locked(Context *ctx, int argc, term argv[])
+{
+    if (argc != 1) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+    if (!camera_af_initialized) {
+        ESP_LOGE(TAG, "Autofocus not initialized! Call esp32cam:af_init() first.");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, bad_state_a));
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+    if (s == NULL) {
+        ESP_LOGE(TAG, "Could not get sensor pointer");
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        return port_create_error_tuple(ctx, term_from_int28(ESP_FAIL));
+    }
+
+    term pos_term = argv[0];
+    uint16_t position;
+    if (!get_uint16_arg(pos_term, &position)) {
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    esp_err_t err = esp_camera_af_set_manual_position(s, position);
+    if (err != ESP_OK) {
+        if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            RAISE_ERROR(MEMORY_ATOM);
+        }
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
+        }
+        return port_create_error_tuple(ctx, term_from_int28(err));
+    }
+
+    return OK_ATOM;
+}
+
+static term nif_esp32cam_af_set_manual_position(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_af_set_manual_position_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+#else
+// Autofocus disabled at build time (CONFIG_CAMERA_AF_SUPPORT=n): shared stub so all
+// af_*_nif entry points resolve and return {error, unsupported} instead of crashing.
+static term nif_esp32cam_af_unsupported(Context *ctx, int argc, term argv[])
+{
+    UNUSED(argc);
+    UNUSED(argv);
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+    if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+    return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
+}
+#endif
+
 static term nif_esp32cam_get_board_info_locked(Context *ctx, int argc, term argv[])
 {
     UNUSED(argc);
@@ -1701,6 +2168,8 @@ static term nif_esp32cam_set_psram_mode_locked(Context *ctx, int argc, term argv
     }
     bool enable = (enable_term == TRUE_ATOM);
 
+    // The driver reinitializes the sensor even when the requested mode is unchanged.
+    camera_af_initialized = 0;
     esp_err_t err = esp_camera_set_psram_mode(enable);
     if (UNLIKELY(err != ESP_OK)) {
         camera_initialized = 0;
@@ -2127,6 +2596,38 @@ static const struct Nif esp32cam_get_psram_mode_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_esp32cam_get_psram_mode
 };
+// When CONFIG_CAMERA_AF_SUPPORT=n the real AF implementations are compiled out, so the
+// af_*_nif entry points fall back to the shared nif_esp32cam_af_unsupported stub.
+#if defined(CONFIG_CAMERA_AF_SUPPORT) && CONFIG_CAMERA_AF_SUPPORT
+#define AF_NIF_PTR(fn) (fn)
+#else
+#define AF_NIF_PTR(fn) (nif_esp32cam_af_unsupported)
+#endif
+static const struct Nif esp32cam_af_init_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = AF_NIF_PTR(nif_esp32cam_af_init)
+};
+static const struct Nif esp32cam_af_set_mode_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = AF_NIF_PTR(nif_esp32cam_af_set_mode)
+};
+static const struct Nif esp32cam_af_trigger_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = AF_NIF_PTR(nif_esp32cam_af_trigger)
+};
+static const struct Nif esp32cam_af_get_status_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = AF_NIF_PTR(nif_esp32cam_af_get_status)
+};
+static const struct Nif esp32cam_af_wait_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = AF_NIF_PTR(nif_esp32cam_af_wait)
+};
+static const struct Nif esp32cam_af_set_manual_position_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = AF_NIF_PTR(nif_esp32cam_af_set_manual_position)
+};
+
 static const struct Nif term_image_display_frame_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_term_image_display_frame
@@ -2198,6 +2699,30 @@ const struct Nif *atomvm_esp32cam_get_nif(const char *nifname)
     if (strcmp("esp32cam:get_psram_mode_nif/0", nifname) == 0) {
         TRACE("Resolved platform nif %s ...\n", nifname);
         return &esp32cam_get_psram_mode_nif;
+    }
+    if (strcmp("esp32cam:af_init_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_af_init_nif;
+    }
+    if (strcmp("esp32cam:af_set_mode_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_af_set_mode_nif;
+    }
+    if (strcmp("esp32cam:af_trigger_nif/0", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_af_trigger_nif;
+    }
+    if (strcmp("esp32cam:af_get_status_nif/0", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_af_get_status_nif;
+    }
+    if (strcmp("esp32cam:af_wait_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_af_wait_nif;
+    }
+    if (strcmp("esp32cam:af_set_manual_position_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_af_set_manual_position_nif;
     }
     if (strcmp("term_image:display_frame_nif/1", nifname) == 0) {
         TRACE("Resolved platform nif %s ...\n", nifname);

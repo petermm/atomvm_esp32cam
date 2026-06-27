@@ -42,7 +42,20 @@
     set_psram_mode_nif/1,
     get_psram_mode/0,
     get_psram_mode_nif/0,
-    resolve_fb_count/2
+    resolve_fb_count/2,
+    af_init/1,
+    af_init_nif/1,
+    af_set_mode/1,
+    af_set_mode_nif/1,
+    af_trigger/0,
+    af_trigger_nif/0,
+    af_get_status/0,
+    af_get_status_nif/0,
+    af_wait/1,
+    af_wait_nif/1,
+    af_set_manual_position/1,
+    af_set_manual_position_nif/1,
+    validate_af_config/1
 ]).
 
 -define(SUPPORTED_BOARDS, [
@@ -729,6 +742,98 @@ get_psram_mode_nif() ->
     throw(nif_error).
 
 %%-----------------------------------------------------------------------------
+%% @param   Config autofocus configuration property list
+%% @returns `ok' or `{error, Reason}'
+%% @doc     Initialize AF support for an autofocus-capable OV5640 sensor.
+%%          Requires CONFIG_CAMERA_AF_SUPPORT=y and esp32-camera >= 2.1.5.
+%%          Reinitialize after camera initialization or PSRAM DMA mode changes.
+%%          A zero timeout_ms retains the driver's previous timeout.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec af_init(Config :: list()) -> ok | {error, term()}.
+af_init(Config) ->
+    case validate_af_config(Config) of
+        ok ->
+            esp32cam:af_init_nif(Config);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+af_init_nif(_Config) ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
+%% @param   Mode autofocus mode: `auto' or `manual'
+%% @returns `ok' or `{error, Reason}'
+%% @doc     Change AF mode.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec af_set_mode(Mode :: auto | manual) -> ok | {error, term()}.
+af_set_mode(Mode) when Mode =:= auto; Mode =:= manual ->
+    esp32cam:af_set_mode_nif(Mode);
+af_set_mode(_Mode) ->
+    {error, badarg}.
+
+af_set_mode_nif(_Mode) ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
+%% @returns `ok' or `{error, Reason}'
+%% @doc     Trigger a single autofocus cycle.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec af_trigger() -> ok | {error, term()}.
+af_trigger() ->
+    esp32cam:af_trigger_nif().
+
+af_trigger_nif() ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
+%% @returns `{ok, Status}' or `{error, Reason}'
+%% @doc     Read current AF status.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec af_get_status() -> {ok, map()} | {error, term()}.
+af_get_status() ->
+    esp32cam:af_get_status_nif().
+
+af_get_status_nif() ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
+%% @param   TimeoutMs timeout in milliseconds. If 0, uses config timeout.
+%% @returns `{ok, Status}' or `{error, Reason}'
+%% @doc     Wait for AF to finish or report focused. Success does not guarantee
+%%          focus was achieved; check the focused field in Status.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec af_wait(TimeoutMs :: non_neg_integer()) -> {ok, map()} | {error, term()}.
+af_wait(TimeoutMs) when is_integer(TimeoutMs), TimeoutMs >= 0, TimeoutMs =< 16#FFFFFFFF ->
+    esp32cam:af_wait_nif(TimeoutMs);
+af_wait(_TimeoutMs) ->
+    {error, badarg}.
+
+af_wait_nif(_TimeoutMs) ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
+%% @param   Position manual lens position
+%% @returns `ok' or `{error, Reason}'
+%% @doc     Set manual lens position. The esp32-camera v2.1.5 OV5640 driver
+%%          does not implement this operation and returns {error, -1} (ESP_FAIL).
+%% @end
+%%-----------------------------------------------------------------------------
+-spec af_set_manual_position(Position :: 0..65535) -> ok | {error, term()}.
+af_set_manual_position(Position) when is_integer(Position), Position >= 0, Position =< 65535 ->
+    esp32cam:af_set_manual_position_nif(Position);
+af_set_manual_position(_Position) ->
+    {error, badarg}.
+
+af_set_manual_position_nif(_Position) ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
 %% Configuration Validation
 %%-----------------------------------------------------------------------------
 validate_init_config(Config) when is_list(Config) ->
@@ -819,6 +924,42 @@ validate_init_config(Config) when is_list(Config) ->
             Error
     end;
 validate_init_config(_) ->
+    {error, badarg}.
+
+validate_af_config(Config) when is_list(Config) ->
+    Mode = proplists:get_value(mode, Config, auto),
+    StepSize = proplists:get_value(step_size, Config, 0),
+    RangeMin = proplists:get_value(range_min, Config, 0),
+    RangeMax = proplists:get_value(range_max, Config, 0),
+    TimeoutMs = proplists:get_value(timeout_ms, Config, 0),
+    case
+        first_config_error([
+            {Mode =:= auto orelse Mode =:= manual, {invalid_mode, Mode}},
+            {
+                is_integer(StepSize) andalso StepSize >= 0 andalso StepSize =< 65535,
+                {invalid_step_size, StepSize}
+            },
+            {
+                is_integer(RangeMin) andalso RangeMin >= 0 andalso RangeMin =< 65535,
+                {invalid_range_min, RangeMin}
+            },
+            {
+                is_integer(RangeMax) andalso RangeMax >= 0 andalso RangeMax =< 65535,
+                {invalid_range_max, RangeMax}
+            },
+            {RangeMin =< RangeMax, {invalid_range, {RangeMin, RangeMax}}},
+            {
+                is_integer(TimeoutMs) andalso TimeoutMs >= 0 andalso TimeoutMs =< 16#FFFFFFFF,
+                {invalid_timeout_ms, TimeoutMs}
+            }
+        ])
+    of
+        ok ->
+            ok;
+        Error ->
+            Error
+    end;
+validate_af_config(_) ->
     {error, badarg}.
 
 validate_custom_board_config(custom, Config) ->
