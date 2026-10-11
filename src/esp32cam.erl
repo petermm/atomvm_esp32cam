@@ -745,7 +745,7 @@ get_psram_mode_nif() ->
 %% @param   Config autofocus configuration property list
 %% @returns `ok' or `{error, Reason}'
 %% @doc     Initialize AF support for an autofocus-capable OV5640 sensor.
-%%          Requires CONFIG_CAMERA_AF_SUPPORT=y and esp32-camera >= 2.1.5.
+%%          Requires CONFIG_CAMERA_AF_SUPPORT=y and esp32-camera >= 2.1.8.
 %%          Reinitialize after camera initialization or PSRAM DMA mode changes.
 %%          A zero timeout_ms retains the driver's previous timeout.
 %% @end
@@ -820,7 +820,7 @@ af_wait_nif(_TimeoutMs) ->
 %%-----------------------------------------------------------------------------
 %% @param   Position manual lens position
 %% @returns `ok' or `{error, Reason}'
-%% @doc     Set manual lens position. The esp32-camera v2.1.5 OV5640 driver
+%% @doc     Set manual lens position. The esp32-camera v2.1.8 OV5640 driver
 %%          does not implement this operation and returns {error, -1} (ESP_FAIL).
 %% @end
 %%-----------------------------------------------------------------------------
