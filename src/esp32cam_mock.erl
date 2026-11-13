@@ -62,6 +62,7 @@ start_mock_mode() ->
 stop_mock_mode() ->
     erase(?MOCK_KEY),
     erase(?MOCK_BEHAVIOR_KEY),
+    erase(esp32cam_mock_sensor_pid),
     %% Mock mode disabled
     ok.
 
@@ -385,16 +386,21 @@ mock_init(Config) ->
                 _ ->
                     case esp32cam:validate_init_config(Config) of
                         {ok, Board} ->
-                            put(esp32cam_current_board, Board),
-                            store_custom_flash_pin(Config, Board),
-                            store_init_controls(Config),
-                            ResolvedFbCount = esp32cam:resolve_fb_count(
-                                proplists:get_value(fb_count, Config, auto),
-                                Config
-                            ),
-                            put(esp32cam_mock_fb_count, ResolvedFbCount),
-                            put(esp32cam_mock_outstanding_leases, 0),
-                            ok;
+                            case check_config_wb_support(Config) of
+                                ok ->
+                                    put(esp32cam_current_board, Board),
+                                    store_custom_flash_pin(Config, Board),
+                                    store_init_controls(Config),
+                                    ResolvedFbCount = esp32cam:resolve_fb_count(
+                                        proplists:get_value(fb_count, Config, auto),
+                                        Config
+                                    ),
+                                    put(esp32cam_mock_fb_count, ResolvedFbCount),
+                                    put(esp32cam_mock_outstanding_leases, 0),
+                                    ok;
+                                {error, _} = Error ->
+                                    Error
+                            end;
                         Error ->
                             Error
                     end
@@ -424,32 +430,42 @@ mock_reconfigure(Config) ->
                                     clear_init_controls(),
                                     {error, mock_reconfigure_failed};
                                 _ ->
-                                    NewBoard =
-                                        case proplists:is_defined(board, Config) of
-                                            true -> ValidatedBoard;
-                                            false -> CurrentBoard
-                                        end,
-                                    put(esp32cam_current_board, NewBoard),
-                                    case proplists:is_defined(board, Config) of
-                                        true ->
-                                            store_custom_flash_pin(Config, NewBoard);
-                                        false when NewBoard =:= custom ->
-                                            case proplists:is_defined(pin_flash, Config) of
-                                                true -> store_custom_flash_pin(Config, custom);
-                                                false -> ok
-                                            end;
-                                        false ->
-                                            erase(esp32cam_custom_flash_pin)
-                                    end,
-                                    clear_reconfigure_state(),
-                                    store_init_controls(Config),
-                                    ResolvedFbCount = esp32cam:resolve_fb_count(
-                                        proplists:get_value(fb_count, Config, auto),
-                                        Config
-                                    ),
-                                    put(esp32cam_mock_fb_count, ResolvedFbCount),
-                                    put(esp32cam_mock_outstanding_leases, 0),
-                                    ok
+                                    case check_config_wb_support(Config) of
+                                        {error, _} = Error ->
+                                            erase(esp32cam_current_board),
+                                            erase(esp32cam_custom_flash_pin),
+                                            clear_init_controls(),
+                                            Error;
+                                        ok ->
+                                            NewBoard =
+                                                case proplists:is_defined(board, Config) of
+                                                    true -> ValidatedBoard;
+                                                    false -> CurrentBoard
+                                                end,
+                                            put(esp32cam_current_board, NewBoard),
+                                            case proplists:is_defined(board, Config) of
+                                                true ->
+                                                    store_custom_flash_pin(Config, NewBoard);
+                                                false when NewBoard =:= custom ->
+                                                    case proplists:is_defined(pin_flash, Config) of
+                                                        true ->
+                                                            store_custom_flash_pin(Config, custom);
+                                                        false ->
+                                                            ok
+                                                    end;
+                                                false ->
+                                                    erase(esp32cam_custom_flash_pin)
+                                            end,
+                                            clear_reconfigure_state(),
+                                            store_init_controls(Config),
+                                            ResolvedFbCount = esp32cam:resolve_fb_count(
+                                                proplists:get_value(fb_count, Config, auto),
+                                                Config
+                                            ),
+                                            put(esp32cam_mock_fb_count, ResolvedFbCount),
+                                            put(esp32cam_mock_outstanding_leases, 0),
+                                            ok
+                                    end
                             end;
                         Error ->
                             Error
@@ -492,6 +508,31 @@ store_init_controls(Config) ->
 supported_controls() ->
     [wb_mode, auto_white_balance, awb_gain, brightness, contrast, saturation, hmirror, vflip].
 
+is_custom_wb_supported() ->
+    case get(esp32cam_mock_sensor_pid) of
+        undefined -> true;
+        ov2640 -> true;
+        ov3660 -> true;
+        ov5640 -> true;
+        gc0308 -> true;
+        16#26 -> true;
+        16#3660 -> true;
+        16#5640 -> true;
+        16#9b -> true;
+        _ -> false
+    end.
+
+check_config_wb_support(Config) ->
+    case proplists:get_value(wb_mode, Config) of
+        {custom, _, _, _} ->
+            case is_custom_wb_supported() of
+                true -> ok;
+                false -> {error, unsupported}
+            end;
+        _ ->
+            ok
+    end.
+
 mock_set_control(Control, Value) ->
     case validate_control(Control, Value) of
         ok ->
@@ -502,6 +543,14 @@ mock_set_control(Control, Value) ->
                     case get(?MOCK_BEHAVIOR_KEY) of
                         always_error ->
                             {error, mock_control_failed};
+                        _ when Control =:= wb_mode andalso is_tuple(Value) ->
+                            case is_custom_wb_supported() of
+                                true ->
+                                    put({esp32cam_control, Control}, Value),
+                                    ok;
+                                false ->
+                                    {error, unsupported}
+                            end;
                         _ ->
                             put({esp32cam_control, Control}, Value),
                             ok
@@ -511,10 +560,11 @@ mock_set_control(Control, Value) ->
             Error
     end.
 
-validate_control(wb_mode, Value) when
-    Value =:= auto; Value =:= sunny; Value =:= cloudy; Value =:= office; Value =:= home
-->
-    ok;
+validate_control(wb_mode, Value) ->
+    case esp32cam:is_valid_wb_mode(Value) of
+        true -> ok;
+        false -> {error, badarg}
+    end;
 validate_control(auto_white_balance, Value) when is_boolean(Value) ->
     ok;
 validate_control(awb_gain, Value) when is_boolean(Value) ->

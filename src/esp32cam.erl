@@ -59,7 +59,8 @@
     af_wait_nif/1,
     af_set_manual_position/1,
     af_set_manual_position_nif/1,
-    validate_af_config/1
+    validate_af_config/1,
+    is_valid_wb_mode/1
 ]).
 
 -define(SUPPORTED_BOARDS, [
@@ -173,7 +174,7 @@
     | {warm_up_frames, 0..100}
     | {auto_white_balance, boolean()}
     | {awb_gain, boolean()}
-    | {wb_mode, auto | sunny | cloudy | office | home}
+    | {wb_mode, wb_mode()}
     | {brightness, -2..2}
     | {contrast, -2..2}
     | {saturation, -2..2}
@@ -198,12 +199,15 @@
     | {pin_flash, integer()}.
 -type esp32cam_config() :: [esp32cam_config_item()].
 
+-type wb_gain() :: 0..255.
+-type wb_mode() ::
+    auto | sunny | cloudy | office | home | {custom, wb_gain(), wb_gain(), wb_gain()}.
 -type capture_param() :: {flash, on | off} | {flash_delay_ms, non_neg_integer()}.
 -type capture_params() :: [capture_param()].
 -type flash_options() :: [{delay_ms, non_neg_integer()}].
 -type control() ::
     wb_mode | auto_white_balance | awb_gain | brightness | contrast | saturation | hmirror | vflip.
--type control_value() :: auto | sunny | cloudy | office | home | boolean() | -2..2.
+-type control_value() :: wb_mode() | boolean() | -2..2.
 -type image() :: binary().
 -opaque frame() :: term().
 -export_type([frame/0]).
@@ -521,6 +525,11 @@ reconfigure_nif(_Config) ->
 %% @param   Value sensor control value
 %% @returns `ok' or error with reason
 %% @doc     Change a supported camera sensor control at runtime.
+%%          For `wb_mode', in addition to presets (`auto', `sunny', `cloudy',
+%%          `office', `home'), `{custom, R, G, B}' may be used with normalized
+%%          8-bit channel gains `0..255' (`64' is nominal `1.0x' unity gain).
+%%          Supported on OV2640, OV3660, OV5640, and GC0308 sensors; returns
+%%          `{error, unsupported}' on other sensors.
 %% @end
 %%-----------------------------------------------------------------------------
 -spec set_control(Control :: control(), Value :: control_value()) ->
@@ -531,10 +540,38 @@ set_control(Control, Value) ->
         Error -> Error
     end.
 
-validate_control(wb_mode, Value) when
+%%-----------------------------------------------------------------------------
+%% @param   Value white balance mode or custom `{custom, R, G, B}' gain tuple
+%% @returns `true' if `Value' is a valid `wb_mode', `false' otherwise.
+%% @doc     Validate a `wb_mode' preset atom or normalized `{custom, R, G, B}'
+%%          8-bit gain tuple (`0..255' per channel).
+%% @end
+%%-----------------------------------------------------------------------------
+-spec is_valid_wb_mode(Value :: term()) -> boolean().
+is_valid_wb_mode(Value) when
     Value =:= auto; Value =:= sunny; Value =:= cloudy; Value =:= office; Value =:= home
 ->
-    ok;
+    true;
+is_valid_wb_mode({custom, R, G, B}) when
+    is_integer(R),
+    R >= 0,
+    R =< 255,
+    is_integer(G),
+    G >= 0,
+    G =< 255,
+    is_integer(B),
+    B >= 0,
+    B =< 255
+->
+    true;
+is_valid_wb_mode(_) ->
+    false.
+
+validate_control(wb_mode, Value) ->
+    case is_valid_wb_mode(Value) of
+        true -> ok;
+        false -> {error, badarg}
+    end;
 validate_control(auto_white_balance, Value) when is_boolean(Value) ->
     ok;
 validate_control(awb_gain, Value) when is_boolean(Value) ->
@@ -962,7 +999,7 @@ validate_init_config(Config) when is_list(Config) ->
             },
             {is_boolean(AutoWhiteBalance), {invalid_auto_white_balance, AutoWhiteBalance}},
             {is_boolean(AwbGain), {invalid_awb_gain, AwbGain}},
-            {lists:member(WbMode, [auto, sunny, cloudy, office, home]), {invalid_wb_mode, WbMode}},
+            {is_valid_wb_mode(WbMode), {invalid_wb_mode, WbMode}},
             {
                 is_integer(Brightness) andalso Brightness >= -2 andalso Brightness =< 2,
                 {invalid_brightness, Brightness}

@@ -128,14 +128,15 @@ When initializing the camera with `esp32cam:init/1`, you pass a proplist of opti
 
 ### White Balance Mode
 * **Key**: `wb_mode`
-* **Type**: `auto | sunny | cloudy | office | home`
+* **Type**: `auto | sunny | cloudy | office | home | {custom, R, G, B}` (where `R`, `G`, `B` are integers `0..255`)
 * **Default**: `auto`
-* **Description**: Selects the white balance preset mode. Requires `auto_white_balance` and `awb_gain` to be enabled:
+* **Description**: Selects the white balance preset mode or manual custom RGB channel gains:
   - `auto`: Auto adjustments (default).
   - `sunny`: Preset for outdoor daylight.
   - `cloudy`: Preset for overcast conditions.
   - `office`: Preset for indoor/office lighting.
   - `home`: Preset for warm home lighting.
+  - `{custom, R, G, B}`: Normalized 8-bit manual RGB gains (`0..255`, where `64` represents nominal `1.0x` unity gain). Supported on OV2640, OV3660, OV5640, and GC0308 sensors; returns `{error, unsupported}` on other sensors. Presets require `auto_white_balance` and `awb_gain` to be enabled.
 
 ---
 
@@ -203,6 +204,7 @@ Camera settings can be changed after initialization without restarting the camer
 
 ```erlang
 ok = esp32cam:set_control(wb_mode, sunny),
+ok = esp32cam:set_control(wb_mode, {custom, 80, 64, 52}),
 ok = esp32cam:set_control(auto_white_balance, true),
 ok = esp32cam:set_control(awb_gain, true),
 ok = esp32cam:set_control(brightness, 1),
@@ -214,7 +216,7 @@ ok = esp32cam:set_control(vflip, false).
 
 Supported controls and values:
 
-* `wb_mode`: `auto | sunny | cloudy | office | home`
+* `wb_mode`: `auto | sunny | cloudy | office | home | {custom, 0..255, 0..255, 0..255}`
 * `auto_white_balance`: `boolean()`
 * `awb_gain`: `boolean()`
 * `brightness`: `-2..2`

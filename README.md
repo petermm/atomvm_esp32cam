@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/atomvm/atomvm_esp32cam/actions/workflows/ci.yml/badge.svg)](https://github.com/atomvm/atomvm_esp32cam/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/esp32cam.svg)](https://hex.pm/packages/esp32cam)
 
-An [AtomVM](https://atomvm.net) NIF driver and Erlang library for controlling ESP32 and ESP32-S3 camera modules (supporting OV2640, OV3660, OV5640, and compatible sensors). It brings native camera capture, zero-copy streaming, runtime reconfiguration, and autofocus control to the Erlang/Elixir BEAM ecosystem.
+An [AtomVM](https://atomvm.net) NIF driver and Erlang library for controlling ESP32 and ESP32-S3 camera modules (supporting OV2640, OV3660, OV5640, GC0308, and compatible sensors). It brings native camera capture, zero-copy streaming, runtime reconfiguration, and autofocus control to the Erlang/Elixir BEAM ecosystem.
 
 This driver runs as a native ESP-IDF component compiled directly into the AtomVM firmware. Pre-built firmware binaries for popular ESP32 and ESP32-S3 camera boards can be flashed straight from your browser using the [Web Installer](markdown/installer.md).
 
@@ -14,7 +14,7 @@ This driver runs as a native ESP-IDF component compiled directly into the AtomVM
 * **15 Predefined Boards + Custom Pinouts**: Out-of-the-box support for popular ESP32 and ESP32-S3 boards (including AI-Thinker, WROVER-KIT, ESP32-S3 WROOM/XIAO/GOOUUU, M5Cam, LilyGO T-Camera, and ESP-EYE), arbitrary `{board, custom}` GPIO pinouts, and runtime detection via `camera_scanner`.
 * **Standard & Zero-Copy Frame Capture**: Capture reference-counted Erlang binaries (`capture/0,1`) or lease PSRAM/driver framebuffers directly with zero extra copies (`capture_frame/0,1`, `frame_binary/1`, `frame_info/1`, `release_frame/1`) and non-blocking readiness checks (`available_frames/0`).
 * **Up to 5MP Resolution & 10 Pixel Formats**: Capture from `96x96` up to `'5mp'` (`2592x1944`) across `jpeg`, `rgb565`, `grayscale`, `yuv422`, `yuv420`, `rgb888`, `raw`, `rgb444`, `rgb555`, and `raw8`.
-* **Runtime Reconfiguration & Sensor Controls**: Dynamically resize or switch pixel formats without a full teardown via `reconfigure/1`, adjust live controls (`brightness`, `contrast`, `saturation`, `hmirror`, `vflip`, `wb_mode`, `auto_white_balance`, `awb_gain`), and toggle PSRAM DMA mode (`set_psram_mode/1`).
+* **Runtime Reconfiguration & Sensor Controls**: Dynamically resize or switch pixel formats without a full teardown via `reconfigure/1`, adjust live controls (`brightness`, `contrast`, `saturation`, `hmirror`, `vflip`, `wb_mode` presets or custom `{custom, R, G, B}` RGB gains), and toggle PSRAM DMA mode (`set_psram_mode/1`).
 * **Flash LED & Warm-Up Calibration**: Built-in board flash control with pre-shot exposure delay (`{flash, on}`, `{flash_delay_ms, Ms}`) and C-level `warm_up_frames` discarding.
 * **OV5640 Autofocus Support**: Opt-in autofocus configuration, triggering, polling, and wait APIs (`af_init/1`, `af_set_mode/1`, `af_trigger/0`, `af_get_status/0`, `af_wait/1`, `af_set_manual_position/1`).
 * **Terminal Preview & Off-Hardware Mocks**: Render captured binaries or leased frames directly in iTerm2-compatible terminals with `term_image:display/1`, and run unit/Common Test suites on your host using `esp32cam_mock`.
@@ -87,7 +87,7 @@ end.
 > **Note**: While any zero-copy view from `frame_binary/1` is still referenced by live Erlang terms, `release_frame/1` prevents premature buffer return; let references go out of scope (or trigger GC) before releasing.
 
 ### 4. Runtime Reconfiguration & Sensor Controls
-Adjust sensor image controls, switch PSRAM DMA mode, or reconfigure resolution/pixel format on the fly without calling `init/1` from scratch:
+Adjust sensor image controls, apply custom RGB white balance gains, switch PSRAM DMA mode, or reconfigure resolution/pixel format on the fly without calling `init/1` from scratch:
 
 ```erlang
 % Change resolution and grab mode (all zero-copy frames must be released first)
@@ -100,6 +100,10 @@ ok = esp32cam:reconfigure([
 % Tune sensor controls live
 ok = esp32cam:set_control(brightness, 1),
 ok = esp32cam:set_control(wb_mode, sunny),
+
+% Or set normalized 8-bit custom RGB white balance gains (0..255, 64 = ~1.0x)
+% Supported on OV2640, OV3660, OV5640, and GC0308 sensors
+ok = esp32cam:set_control(wb_mode, {custom, 80, 64, 52}),
 
 % Toggle PSRAM DMA mode (ESP32-S3)
 ok = esp32cam:set_psram_mode(true).

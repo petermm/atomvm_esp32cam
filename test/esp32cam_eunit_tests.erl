@@ -38,7 +38,8 @@ esp32cam_test_() ->
             {"Runtime Control Tests", [
                 fun test_set_white_balance_controls/0,
                 fun test_set_control_invalid_values/0,
-                fun test_set_control_before_init/0
+                fun test_set_control_before_init/0,
+                test_custom_wb_gains()
             ]},
             {"Flash Tests", [
                 fun test_flash_capture_basic/0,
@@ -365,6 +366,83 @@ test_set_control_before_init() ->
         ?assertEqual({error, bad_state}, esp32cam_mock:set_control(saturation, 1)),
         ?assertEqual({error, bad_state}, esp32cam_mock:set_control(hmirror, true)),
         ?assertEqual({error, bad_state}, esp32cam_mock:set_control(vflip, false))
+    end).
+
+test_custom_wb_gains() ->
+    ?_test(begin
+        erase(esp32cam_mock_sensor_pid),
+
+        % 1. Init and reconfigure with custom WB gains
+        ?assertEqual(ok, esp32cam_mock:init([{wb_mode, {custom, 80, 64, 96}}])),
+        ?assertEqual({custom, 80, 64, 96}, get({esp32cam_control, wb_mode})),
+        ?assertEqual(ok, esp32cam_mock:reconfigure([{wb_mode, {custom, 100, 64, 110}}])),
+        ?assertEqual({custom, 100, 64, 110}, get({esp32cam_control, wb_mode})),
+
+        % 2. Runtime set_control with custom gains and boundary values, then switch back to preset
+        ?assertEqual(ok, esp32cam_mock:set_control(wb_mode, {custom, 128, 64, 200})),
+        ?assertEqual({custom, 128, 64, 200}, get({esp32cam_control, wb_mode})),
+        ?assertEqual(ok, esp32cam_mock:set_control(wb_mode, {custom, 0, 0, 0})),
+        ?assertEqual({custom, 0, 0, 0}, get({esp32cam_control, wb_mode})),
+        ?assertEqual(ok, esp32cam_mock:set_control(wb_mode, {custom, 255, 255, 255})),
+        ?assertEqual({custom, 255, 255, 255}, get({esp32cam_control, wb_mode})),
+        ?assertEqual(ok, esp32cam_mock:set_control(wb_mode, sunny)),
+        ?assertEqual(sunny, get({esp32cam_control, wb_mode})),
+
+        % 3. Invalid custom tuples and out-of-range gain values
+        InvalidModes = [
+            {custom, -1, 64, 64},
+            {custom, 64, 256, 64},
+            {custom, 64, 64, 1.5},
+            {custom, 64, 64},
+            {other, 64, 64, 64}
+        ],
+        lists:foreach(
+            fun(BadMode) ->
+                ?assertEqual({error, badarg}, esp32cam_mock:set_control(wb_mode, BadMode)),
+                ?assertEqual(
+                    {error, {invalid_wb_mode, BadMode}}, esp32cam_mock:init([{wb_mode, BadMode}])
+                ),
+                ?assertEqual(
+                    {error, {invalid_wb_mode, BadMode}},
+                    esp32cam_mock:reconfigure([{wb_mode, BadMode}])
+                )
+            end,
+            InvalidModes
+        ),
+
+        % 4. Supported sensor PIDs (OV2640, OV3660, OV5640, GC0308)
+        lists:foreach(
+            fun(Sensor) ->
+                put(esp32cam_mock_sensor_pid, Sensor),
+                ?assertEqual(ok, esp32cam_mock:init([{wb_mode, {custom, 64, 64, 64}}])),
+                ?assertEqual(ok, esp32cam_mock:set_control(wb_mode, {custom, 120, 64, 90}))
+            end,
+            [ov2640, ov3660, ov5640, gc0308]
+        ),
+
+        % 5. Unsupported sensors return {error, unsupported}
+        lists:foreach(
+            fun(Sensor) ->
+                put(esp32cam_mock_sensor_pid, Sensor),
+                ?assertEqual(ok, esp32cam_mock:init()),
+                ?assertEqual(
+                    {error, unsupported}, esp32cam_mock:set_control(wb_mode, {custom, 64, 64, 64})
+                ),
+                ?assertEqual(
+                    {error, unsupported}, esp32cam_mock:init([{wb_mode, {custom, 64, 64, 64}}])
+                ),
+                ?assertEqual(ok, esp32cam_mock:init()),
+                ?assertEqual(
+                    {error, unsupported},
+                    esp32cam_mock:reconfigure([{wb_mode, {custom, 64, 64, 64}}])
+                ),
+                ?assertEqual(undefined, get(esp32cam_current_board))
+            end,
+            [nt99141, ov7725]
+        ),
+
+        erase(esp32cam_mock_sensor_pid),
+        ok = esp32cam_mock:init()
     end).
 
 %%====================================================================

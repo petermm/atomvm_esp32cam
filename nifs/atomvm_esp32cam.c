@@ -991,6 +991,151 @@ static int get_pin_value(term pin_term, int default_val)
     return INVALID_PIN_VALUE;
 }
 
+typedef struct {
+    bool is_set;
+    bool is_custom;
+    int preset;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} wb_mode_config_t;
+
+static bool parse_wb_gain_channel(term t, uint8_t *out)
+{
+    if (!term_is_any_integer(t)) {
+        return false;
+    }
+    avm_int_t val = term_to_int(t);
+    if (val < 0 || val > 255) {
+        return false;
+    }
+    *out = (uint8_t) val;
+    return true;
+}
+
+static bool parse_wb_mode(Context *ctx, term wb_term, wb_mode_config_t *out)
+{
+    out->is_set = false;
+    out->is_custom = false;
+    out->preset = 0;
+    out->r = 0;
+    out->g = 0;
+    out->b = 0;
+
+    if (term_is_nil(wb_term)) {
+        return true;
+    }
+
+    if (wb_term == globalcontext_make_atom(ctx->global, auto_a)) {
+        out->is_set = true;
+        out->preset = 0;
+        return true;
+    } else if (wb_term == globalcontext_make_atom(ctx->global, sunny_a)) {
+        out->is_set = true;
+        out->preset = 1;
+        return true;
+    } else if (wb_term == globalcontext_make_atom(ctx->global, cloudy_a)) {
+        out->is_set = true;
+        out->preset = 2;
+        return true;
+    } else if (wb_term == globalcontext_make_atom(ctx->global, office_a)) {
+        out->is_set = true;
+        out->preset = 3;
+        return true;
+    } else if (wb_term == globalcontext_make_atom(ctx->global, home_a)) {
+        out->is_set = true;
+        out->preset = 4;
+        return true;
+    } else if (term_is_tuple(wb_term) && term_get_tuple_arity(wb_term) == 4) {
+        if (term_get_tuple_element(wb_term, 0) != globalcontext_make_atom(ctx->global, custom_a)) {
+            return false;
+        }
+        if (!parse_wb_gain_channel(term_get_tuple_element(wb_term, 1), &out->r) ||
+            !parse_wb_gain_channel(term_get_tuple_element(wb_term, 2), &out->g) ||
+            !parse_wb_gain_channel(term_get_tuple_element(wb_term, 3), &out->b)) {
+            return false;
+        }
+        out->is_set = true;
+        out->is_custom = true;
+        return true;
+    }
+
+    return false;
+}
+
+static int apply_wb_mode(sensor_t *s, const wb_mode_config_t *wb, bool *out_unsupported)
+{
+    *out_unsupported = false;
+    if (!wb->is_set) {
+        return 0;
+    }
+
+    if (!wb->is_custom) {
+        return s->set_wb_mode != NULL ? s->set_wb_mode(s, wb->preset) : ESP_FAIL;
+    }
+
+    if (s->set_reg == NULL) {
+        *out_unsupported = true;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    int err = 0;
+    switch (s->id.PID) {
+        case OV2640_PID:
+            err = s->set_reg(s, 0xC7, 0x40, 0x40);
+            if (err == 0) {
+                err = s->set_reg(s, 0xCC, 0xFF, wb->r);
+            }
+            if (err == 0) {
+                err = s->set_reg(s, 0xCD, 0xFF, wb->g);
+            }
+            if (err == 0) {
+                err = s->set_reg(s, 0xCE, 0xFF, wb->b);
+            }
+            return err;
+
+        case OV3660_PID:
+        case OV5640_PID: {
+            int r12 = ((int) wb->r << 4) | ((int) wb->r >> 4);
+            int g12 = ((int) wb->g << 4) | ((int) wb->g >> 4);
+            int b12 = ((int) wb->b << 4) | ((int) wb->b >> 4);
+            err = s->set_reg(s, 0x3406, 0xFF, 0x01);
+            if (err == 0) {
+                err = s->set_reg(s, 0x3400, 0x0FFF, r12);
+            }
+            if (err == 0) {
+                err = s->set_reg(s, 0x3402, 0x0FFF, g12);
+            }
+            if (err == 0) {
+                err = s->set_reg(s, 0x3404, 0x0FFF, b12);
+            }
+            return err;
+        }
+
+        case GC0308_PID:
+            if (s->set_whitebal != NULL) {
+                err = s->set_whitebal(s, 0);
+            }
+            if (err == 0) {
+                err = s->set_reg(s, 0xFE, 0xFF, 0x00);
+            }
+            if (err == 0) {
+                err = s->set_reg(s, 0x5A, 0xFF, wb->r);
+            }
+            if (err == 0) {
+                err = s->set_reg(s, 0x5B, 0xFF, wb->g);
+            }
+            if (err == 0) {
+                err = s->set_reg(s, 0x5C, 0xFF, wb->b);
+            }
+            return err;
+
+        default:
+            *out_unsupported = true;
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
 static camera_config_t *create_camera_config(const board_config_t *board_config, framesize_t frame_size, int jpeg_quality,
     int pixel_format, int xclk_freq_hz, int fb_count,
     int fb_location, int grab_mode, int sccb_i2c_port, int ledc_timer, int ledc_channel, int conv_mode)
@@ -1350,23 +1495,11 @@ static term nif_esp32cam_apply_config_locked(Context *ctx, int argc, term argv[]
         }
     }
 
-    int wb_mode = INVALID_CONFIG_VALUE;
+    wb_mode_config_t wb_mode_cfg;
     term wb_mode_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, wb_mode_a));
-    if (!term_is_nil(wb_mode_term)) {
-        if (wb_mode_term == globalcontext_make_atom(ctx->global, auto_a)) {
-            wb_mode = 0;
-        } else if (wb_mode_term == globalcontext_make_atom(ctx->global, sunny_a)) {
-            wb_mode = 1;
-        } else if (wb_mode_term == globalcontext_make_atom(ctx->global, cloudy_a)) {
-            wb_mode = 2;
-        } else if (wb_mode_term == globalcontext_make_atom(ctx->global, office_a)) {
-            wb_mode = 3;
-        } else if (wb_mode_term == globalcontext_make_atom(ctx->global, home_a)) {
-            wb_mode = 4;
-        } else {
-            ESP_LOGE(TAG, "Invalid wb_mode parameter");
-            RAISE_ERROR(BADARG_ATOM);
-        }
+    if (!parse_wb_mode(ctx, wb_mode_term, &wb_mode_cfg)) {
+        ESP_LOGE(TAG, "Invalid wb_mode parameter");
+        RAISE_ERROR(BADARG_ATOM);
     }
 
     bool brightness_set = false;
@@ -1510,6 +1643,7 @@ static term nif_esp32cam_apply_config_locked(Context *ctx, int argc, term argv[]
     sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
         int sensor_err = 0;
+        bool wb_unsupported = false;
         if (auto_white_balance != INVALID_CONFIG_VALUE) {
             sensor_err = s->set_whitebal != NULL
                 ? s->set_whitebal(s, auto_white_balance)
@@ -1520,10 +1654,8 @@ static term nif_esp32cam_apply_config_locked(Context *ctx, int argc, term argv[]
                 ? s->set_awb_gain(s, awb_gain)
                 : ESP_FAIL;
         }
-        if (sensor_err == 0 && wb_mode != INVALID_CONFIG_VALUE) {
-            sensor_err = s->set_wb_mode != NULL
-                ? s->set_wb_mode(s, wb_mode)
-                : ESP_FAIL;
+        if (sensor_err == 0 && wb_mode_cfg.is_set) {
+            sensor_err = apply_wb_mode(s, &wb_mode_cfg, &wb_unsupported);
         }
         if (sensor_err == 0 && brightness_set) {
             sensor_err = s->set_brightness != NULL
@@ -1560,9 +1692,12 @@ static term nif_esp32cam_apply_config_locked(Context *ctx, int argc, term argv[]
             if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
                 RAISE_ERROR(MEMORY_ATOM);
             }
+            if (wb_unsupported) {
+                return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
+            }
             return port_create_error_tuple(ctx, term_from_int28(sensor_err));
         }
-    } else if (auto_white_balance != INVALID_CONFIG_VALUE || awb_gain != INVALID_CONFIG_VALUE || wb_mode != INVALID_CONFIG_VALUE
+    } else if (auto_white_balance != INVALID_CONFIG_VALUE || awb_gain != INVALID_CONFIG_VALUE || wb_mode_cfg.is_set
         || brightness_set || contrast_set || saturation_set
         || hmirror != INVALID_CONFIG_VALUE || vflip != INVALID_CONFIG_VALUE) {
         ESP_LOGW(TAG, "Could not get sensor pointer to apply camera settings");
@@ -1706,25 +1841,14 @@ static term nif_esp32cam_set_control_locked(Context *ctx, int argc, term argv[])
     term control = argv[0];
     term value = argv[1];
     int sensor_err = ESP_FAIL;
+    bool wb_unsupported = false;
 
     if (control == globalcontext_make_atom(ctx->global, wb_mode_a)) {
-        int wb_mode;
-        if (value == globalcontext_make_atom(ctx->global, auto_a)) {
-            wb_mode = 0;
-        } else if (value == globalcontext_make_atom(ctx->global, sunny_a)) {
-            wb_mode = 1;
-        } else if (value == globalcontext_make_atom(ctx->global, cloudy_a)) {
-            wb_mode = 2;
-        } else if (value == globalcontext_make_atom(ctx->global, office_a)) {
-            wb_mode = 3;
-        } else if (value == globalcontext_make_atom(ctx->global, home_a)) {
-            wb_mode = 4;
-        } else {
+        wb_mode_config_t wb_mode_cfg;
+        if (!parse_wb_mode(ctx, value, &wb_mode_cfg) || !wb_mode_cfg.is_set) {
             RAISE_ERROR(BADARG_ATOM);
         }
-        if (s->set_wb_mode != NULL) {
-            sensor_err = s->set_wb_mode(s, wb_mode);
-        }
+        sensor_err = apply_wb_mode(s, &wb_mode_cfg, &wb_unsupported);
     } else if (control == globalcontext_make_atom(ctx->global, auto_white_balance_a)) {
         if (value != TRUE_ATOM && value != FALSE_ATOM) {
             RAISE_ERROR(BADARG_ATOM);
@@ -1794,6 +1918,9 @@ static term nif_esp32cam_set_control_locked(Context *ctx, int argc, term argv[])
         ESP_LOGE(TAG, "Failed to apply sensor control: err=%d", sensor_err);
         if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
             RAISE_ERROR(MEMORY_ATOM);
+        }
+        if (wb_unsupported) {
+            return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
         }
         return port_create_error_tuple(ctx, term_from_int28(sensor_err));
     }
