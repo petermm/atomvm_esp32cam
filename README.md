@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/atomvm/atomvm_esp32cam/actions/workflows/ci.yml/badge.svg)](https://github.com/atomvm/atomvm_esp32cam/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/esp32cam.svg)](https://hex.pm/packages/esp32cam)
 
-An [AtomVM](https://atomvm.net) NIF driver and Erlang library for controlling ESP32 and ESP32-S3 camera modules (supporting OV2640, OV3660, and compatible image sensors). It brings native camera capture, zero-copy streaming, and runtime sensor controls to the Erlang/Elixir BEAM ecosystem.
+An [AtomVM](https://atomvm.net) NIF driver and Erlang library for controlling ESP32 and ESP32-S3 camera modules (supporting OV2640, OV3660, OV5640, and compatible image sensors). It brings native camera capture, zero-copy streaming, and autofocus control to the Erlang/Elixir BEAM ecosystem.
 
 This driver runs as a native ESP-IDF component compiled directly into the AtomVM firmware. Pre-built firmware binaries for popular ESP32 and ESP32-S3 camera boards can be flashed straight from your browser using the [Web Installer](markdown/installer.md).
 
@@ -16,7 +16,15 @@ This driver runs as a native ESP-IDF component compiled directly into the AtomVM
 * **Up to 5MP Resolution & 10 Pixel Formats**: Capture from `96x96` up to `'5mp'` (`2592x1944`) across `jpeg`, `rgb565`, `grayscale`, `yuv422`, `yuv420`, `rgb888`, `raw`, `rgb444`, `rgb555`, and `raw8`.
 * **Runtime Sensor Controls & PSRAM DMA**: Adjust live controls (`brightness`, `contrast`, `saturation`, `hmirror`, `vflip`, `wb_mode`, `auto_white_balance`, `awb_gain`) without restarting the camera, and toggle PSRAM DMA mode (`set_psram_mode/1`).
 * **Flash LED & Warm-Up Calibration**: Built-in board flash control with pre-shot exposure delay (`{flash, on}`, `{flash_delay_ms, Ms}`) and C-level `warm_up_frames` discarding.
+* **OV5640 Autofocus Support**: Opt-in autofocus configuration, triggering, polling, and wait APIs (`af_init/1`, `af_set_mode/1`, `af_trigger/0`, `af_get_status/0`, `af_wait/1`, `af_set_manual_position/1`).
 * **Terminal Preview & Off-Hardware Mocks**: Render captured binaries or leased frames directly in iTerm2-compatible terminals with `term_image:display/1`, and run unit/Common Test suites on your host using `esp32cam_mock`.
+
+---
+
+## Requirements
+
+* **ESP-IDF**: `>= 5.1.0`
+* **Driver Component**: `espressif/esp32-camera >= 2.1.9,<3.0.0` (configured in `idf_component.yml`)
 
 ---
 
@@ -84,6 +92,39 @@ ok = esp32cam:set_control(wb_mode, sunny),
 ok = esp32cam:set_psram_mode(true).
 ```
 
+### 5. Autofocus Control (OV5640 Sensors)
+Autofocus requires an OV5640 module with an autofocus coil, `esp32-camera >= 2.1.9`,
+and both `CONFIG_OV5640_SUPPORT=y` and `CONFIG_CAMERA_AF_SUPPORT=y` in your firmware configuration.
+AF is **disabled by default** in `sdkconfig.defaults.esp32cam` to save flash.
+With AF disabled, all AF NIFs return `{error, unsupported}`. With AF enabled,
+`af_init/1` returns `{error, unsupported}` for non-AF sensors such as OV2640.
+
+```erlang
+% Initialize autofocus config
+ok = esp32cam:af_init([{mode, auto}, {timeout_ms, 2000}]),
+
+% Trigger focusing
+ok = esp32cam:af_trigger(),
+
+% Wait for completion, then verify that focus was actually achieved.
+% af_wait/1 can return {ok, Status} with focused => false.
+{ok, #{busy := false, focused := true}} = esp32cam:af_wait(2000),
+
+% Capture image now that it's focused!
+{ok, Image} = esp32cam:capture().
+```
+
+With AF enabled, operations before successful `af_init/1` return `{error, bad_state}`.
+Reinitializing the camera or setting PSRAM DMA mode (even to the current value)
+requires another `af_init/1`. A failed driver-level AF initialization also invalidates AF readiness.
+
+Timeouts are unsigned 32-bit milliseconds. `af_wait(0)` uses the configured timeout;
+initializing AF with `timeout_ms = 0` keeps the driver's previous timeout (initially 2000 ms).
+Range and step values are unsigned 16-bit integers, with `range_min =< range_max`.
+Both range endpoints default to zero, so a nonzero minimum requires an explicit maximum.
+The v2.1.9 driver still does not apply range/step settings, and its OV5640 manual-position
+callback is unimplemented: `af_set_manual_position/1` returns `{error, -1}` (`ESP_FAIL`).
+
 ---
 
 ## API Overview
@@ -94,6 +135,7 @@ ok = esp32cam:set_psram_mode(true).
 | **Standard Capture** | `esp32cam:capture/0,1`, `esp32cam:capture_with_flash/1,2` |
 | **Zero-Copy Capture** | `esp32cam:capture_frame/0,1`, `esp32cam:frame_binary/1`, `esp32cam:frame_info/1`, `esp32cam:release_frame/1` |
 | **Controls & DMA** | `esp32cam:set_control/2`, `esp32cam:set_psram_mode/1`, `esp32cam:get_psram_mode/0` |
+| **Autofocus (OV5640)** | `esp32cam:af_init/1`, `esp32cam:af_set_mode/1`, `esp32cam:af_trigger/0`, `esp32cam:af_get_status/0`, `esp32cam:af_wait/1`, `esp32cam:af_set_manual_position/1` |
 | **Utilities** | `camera_scanner:scan/0,1`, `term_image:display/1` |
 
 ---

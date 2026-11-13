@@ -176,6 +176,21 @@ jobs:
           fi
           idf.py build
 
+      - name: "Build OV5640 autofocus configuration"
+        if: matrix.soc == 'esp32s3' && matrix.flavor == ''
+        shell: bash
+        working-directory: ./AtomVM/src/platforms/esp32/
+        run: |
+          . $IDF_PATH/export.sh
+          cp sdkconfig sdkconfig.af
+          sed -i \
+            -e '/^# CONFIG_CAMERA_AF_SUPPORT is not set$/d; /^CONFIG_CAMERA_AF_SUPPORT=/d' \
+            -e '/^# CONFIG_OV5640_SUPPORT is not set$/d; /^CONFIG_OV5640_SUPPORT=/d' sdkconfig.af
+          printf '\nCONFIG_OV5640_SUPPORT=y\nCONFIG_CAMERA_AF_SUPPORT=y\n' >> sdkconfig.af
+          # Use a separate build directory so shipped firmware retains default-off AF.
+          idf.py -B build-af -DSDKCONFIG="$PWD/sdkconfig.af" -DATOMVM_ELIXIR_SUPPORT=off build
+          grep -q '^#define CONFIG_CAMERA_AF_SUPPORT 1$' build-af/config/sdkconfig.h
+
       - name: "Stage esp32cam example packbeam for mkimage"
         shell: bash
         run: |

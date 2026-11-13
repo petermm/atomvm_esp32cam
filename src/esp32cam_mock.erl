@@ -21,7 +21,13 @@
     collect_frame/1,
     start_mock_mode/0,
     stop_mock_mode/0,
-    set_mock_behavior/1
+    set_mock_behavior/1,
+    af_init/1,
+    af_set_mode/1,
+    af_trigger/0,
+    af_get_status/0,
+    af_wait/1,
+    af_set_manual_position/1
 ]).
 
 %% Mock behavior configuration
@@ -368,7 +374,18 @@ clear_init_controls() ->
     lists:foreach(
         fun(Control) -> erase({esp32cam_control, Control}) end,
         supported_controls()
-    ).
+    ),
+    erase(esp32cam_mock_af_initialized),
+    erase(esp32cam_mock_af_mode),
+    erase(esp32cam_mock_af_step_size),
+    erase(esp32cam_mock_af_range_min),
+    erase(esp32cam_mock_af_range_max),
+    erase(esp32cam_mock_af_timeout_ms),
+    erase(esp32cam_mock_af_focused),
+    erase(esp32cam_mock_af_busy),
+    erase(esp32cam_mock_af_manual_position),
+    erase(esp32cam_mock_af_supported),
+    erase(esp32cam_mock_af_manual_supported).
 
 store_init_controls(Config) ->
     lists:foreach(
@@ -727,8 +744,10 @@ mock_set_psram_mode(Enable) ->
                 Leases when is_integer(Leases), Leases > 0 ->
                     {error, frames_in_use};
                 _ ->
+                    erase(esp32cam_mock_af_initialized),
                     case get(?MOCK_BEHAVIOR_KEY) of
                         always_error ->
+                            erase(esp32cam_current_board),
                             {error, mock_control_failed};
                         _ ->
                             put(esp32cam_mock_psram_dma_mode, Enable),
@@ -745,6 +764,218 @@ mock_get_psram_mode() ->
             case get(esp32cam_mock_psram_dma_mode) of
                 undefined -> false;
                 Mode -> Mode
+            end
+    end.
+
+af_init(Config) ->
+    case is_mock_mode() of
+        true ->
+            mock_af_init(Config);
+        false ->
+            try
+                esp32cam:af_init_nif(Config)
+            catch
+                throw:nif_error -> mock_af_init(Config);
+                _:_ -> mock_af_init(Config)
+            end
+    end.
+
+af_set_mode(Mode) ->
+    case is_mock_mode() of
+        true ->
+            mock_af_set_mode(Mode);
+        false ->
+            try
+                esp32cam:af_set_mode_nif(Mode)
+            catch
+                throw:nif_error -> mock_af_set_mode(Mode);
+                _:_ -> mock_af_set_mode(Mode)
+            end
+    end.
+
+af_trigger() ->
+    case is_mock_mode() of
+        true ->
+            mock_af_trigger();
+        false ->
+            try
+                esp32cam:af_trigger_nif()
+            catch
+                throw:nif_error -> mock_af_trigger();
+                _:_ -> mock_af_trigger()
+            end
+    end.
+
+af_get_status() ->
+    case is_mock_mode() of
+        true ->
+            mock_af_get_status();
+        false ->
+            try
+                esp32cam:af_get_status_nif()
+            catch
+                throw:nif_error -> mock_af_get_status();
+                _:_ -> mock_af_get_status()
+            end
+    end.
+
+af_wait(TimeoutMs) ->
+    case is_mock_mode() of
+        true ->
+            mock_af_wait(TimeoutMs);
+        false ->
+            try
+                esp32cam:af_wait_nif(TimeoutMs)
+            catch
+                throw:nif_error -> mock_af_wait(TimeoutMs);
+                _:_ -> mock_af_wait(TimeoutMs)
+            end
+    end.
+
+af_set_manual_position(Position) ->
+    case is_mock_mode() of
+        true ->
+            mock_af_set_manual_position(Position);
+        false ->
+            try
+                esp32cam:af_set_manual_position_nif(Position)
+            catch
+                throw:nif_error -> mock_af_set_manual_position(Position);
+                _:_ -> mock_af_set_manual_position(Position)
+            end
+    end.
+
+mock_af_init(Config) ->
+    case ensure_initialized() of
+        {error, bad_state} ->
+            {error, bad_state};
+        ok ->
+            case get(esp32cam_mock_af_supported) of
+                true ->
+                    case esp32cam:validate_af_config(Config) of
+                        ok ->
+                            Mode = proplists:get_value(mode, Config, auto),
+                            StepSize = proplists:get_value(step_size, Config, 0),
+                            RangeMin = proplists:get_value(range_min, Config, 0),
+                            RangeMax = proplists:get_value(range_max, Config, 0),
+                            TimeoutMs = proplists:get_value(timeout_ms, Config, 0),
+                            erase(esp32cam_mock_af_initialized),
+                            case get(?MOCK_BEHAVIOR_KEY) of
+                                always_error ->
+                                    {error, -1};
+                                _ ->
+                                    put(esp32cam_mock_af_initialized, true),
+                                    put(esp32cam_mock_af_mode, Mode),
+                                    put(esp32cam_mock_af_step_size, StepSize),
+                                    put(esp32cam_mock_af_range_min, RangeMin),
+                                    put(esp32cam_mock_af_range_max, RangeMax),
+                                    case TimeoutMs of
+                                        0 -> ok;
+                                        _ -> put(esp32cam_mock_af_timeout_ms, TimeoutMs)
+                                    end,
+                                    put(esp32cam_mock_af_focused, false),
+                                    put(esp32cam_mock_af_busy, false),
+                                    put(esp32cam_mock_af_manual_position, 0),
+                                    ok
+                            end;
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                _ ->
+                    {error, unsupported}
+            end
+    end.
+
+mock_af_set_mode(Mode) ->
+    case ensure_initialized() of
+        {error, bad_state} ->
+            {error, bad_state};
+        ok ->
+            case get(esp32cam_mock_af_initialized) of
+                true when Mode =:= auto; Mode =:= manual ->
+                    put(esp32cam_mock_af_mode, Mode),
+                    ok;
+                true ->
+                    {error, badarg};
+                _ ->
+                    {error, bad_state}
+            end
+    end.
+
+mock_af_trigger() ->
+    case ensure_initialized() of
+        {error, bad_state} ->
+            {error, bad_state};
+        ok ->
+            case get(esp32cam_mock_af_initialized) of
+                true ->
+                    put(esp32cam_mock_af_busy, true),
+                    put(esp32cam_mock_af_focused, false),
+                    ok;
+                _ ->
+                    {error, bad_state}
+            end
+    end.
+
+mock_af_get_status() ->
+    case ensure_initialized() of
+        {error, bad_state} ->
+            {error, bad_state};
+        ok ->
+            case get(esp32cam_mock_af_initialized) of
+                true ->
+                    Busy = get(esp32cam_mock_af_busy),
+                    Focused = get(esp32cam_mock_af_focused),
+                    {ok, #{
+                        raw => 0,
+                        focused => Focused,
+                        busy => Busy
+                    }};
+                _ ->
+                    {error, bad_state}
+            end
+    end.
+
+mock_af_wait(TimeoutMs) ->
+    case ensure_initialized() of
+        {error, bad_state} ->
+            {error, bad_state};
+        ok ->
+            case get(esp32cam_mock_af_initialized) of
+                true when is_integer(TimeoutMs), TimeoutMs >= 0, TimeoutMs =< 16#FFFFFFFF ->
+                    case get(esp32cam_mock_af_busy) of
+                        true ->
+                            put(esp32cam_mock_af_busy, false),
+                            put(esp32cam_mock_af_focused, true);
+                        _ ->
+                            ok
+                    end,
+                    mock_af_get_status();
+                true ->
+                    {error, badarg};
+                _ ->
+                    {error, bad_state}
+            end
+    end.
+
+mock_af_set_manual_position(Position) ->
+    case ensure_initialized() of
+        {error, bad_state} ->
+            {error, bad_state};
+        ok ->
+            case get(esp32cam_mock_af_initialized) of
+                true when is_integer(Position), Position >= 0, Position =< 65535 ->
+                    case get(esp32cam_mock_af_manual_supported) of
+                        true ->
+                            put(esp32cam_mock_af_manual_position, Position),
+                            ok;
+                        _ ->
+                            {error, -1}
+                    end;
+                true ->
+                    {error, badarg};
+                _ ->
+                    {error, bad_state}
             end
     end.
 

@@ -70,6 +70,17 @@ esp32cam_test_() ->
                 fun test_psram_size/0,
                 fun test_psram_dma_mode/0,
                 fun test_fb_count_auto_resolution/0
+            ]},
+            {"Autofocus Tests", [
+                test_af_init_valid(),
+                test_af_init_invalid(),
+                test_af_init_unsupported(),
+                test_af_set_mode(),
+                test_af_trigger_and_status(),
+                test_af_wait(),
+                test_af_set_manual_position(),
+                test_af_before_init(),
+                test_af_reinitialization()
             ]}
         ]}}.
 
@@ -725,6 +736,222 @@ test_fb_count_auto_resolution() ->
 
         % Clean up
         erase(esp32cam_mock_psram_size)
+    end).
+
+test_af_init_valid() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        % Verify default is unsupported
+        ?assertEqual({error, unsupported}, safe_call(fun() -> esp32cam_mock:af_init([]) end)),
+        % Set supported
+        put(esp32cam_mock_af_supported, true),
+        ?assertEqual(ok, safe_call(fun() -> esp32cam_mock:af_init([]) end)),
+        ?assertEqual(
+            ok, safe_call(fun() -> esp32cam_mock:af_init([{mode, auto}, {timeout_ms, 1000}]) end)
+        ),
+        ?assertEqual(
+            ok,
+            safe_call(fun() ->
+                esp32cam_mock:af_init([
+                    {mode, manual}, {step_size, 10}, {range_min, 1}, {range_max, 100}
+                ])
+            end)
+        ),
+        ?assertEqual(
+            ok,
+            esp32cam_mock:af_init([
+                {step_size, 65535}, {range_max, 65535}, {timeout_ms, 16#FFFFFFFF}
+            ])
+        ),
+        % Property lists use the first occurrence of a key.
+        ?assertEqual(ok, esp32cam_mock:af_init([{timeout_ms, 1}, {timeout_ms, -1}])),
+        ?assertEqual(
+            {error, {invalid_timeout_ms, -1}},
+            esp32cam_mock:af_init([{timeout_ms, -1}, {timeout_ms, 1}])
+        ),
+        erase(esp32cam_mock_af_supported)
+    end).
+
+test_af_init_invalid() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        put(esp32cam_mock_af_supported, true),
+        ?assertMatch(
+            {error, {invalid_mode, _}},
+            safe_call(fun() -> esp32cam_mock:af_init([{mode, invalid}]) end)
+        ),
+        ?assertMatch(
+            {error, {invalid_step_size, _}},
+            safe_call(fun() -> esp32cam_mock:af_init([{step_size, -1}]) end)
+        ),
+        ?assertMatch(
+            {error, {invalid_step_size, _}},
+            safe_call(fun() -> esp32cam_mock:af_init([{step_size, 65536}]) end)
+        ),
+        ?assertMatch(
+            {error, {invalid_range_min, _}},
+            safe_call(fun() -> esp32cam_mock:af_init([{range_min, 70000}]) end)
+        ),
+        ?assertMatch(
+            {error, {invalid_range_max, _}},
+            safe_call(fun() -> esp32cam_mock:af_init([{range_max, -10}]) end)
+        ),
+        ?assertMatch(
+            {error, {invalid_range, _}},
+            safe_call(fun() -> esp32cam_mock:af_init([{range_min, 100}, {range_max, 50}]) end)
+        ),
+        ?assertEqual({error, {invalid_range, {1, 0}}}, esp32cam_mock:af_init([{range_min, 1}])),
+        ?assertMatch(
+            {error, {invalid_timeout_ms, _}},
+            safe_call(fun() -> esp32cam_mock:af_init([{timeout_ms, -5}]) end)
+        ),
+        ?assertEqual(
+            {error, {invalid_timeout_ms, 16#100000000}},
+            esp32cam_mock:af_init([{timeout_ms, 16#100000000}])
+        ),
+        erase(esp32cam_mock_af_supported)
+    end).
+
+test_af_init_unsupported() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        % default is unsupported
+        ?assertEqual({error, unsupported}, safe_call(fun() -> esp32cam_mock:af_init([]) end)),
+        % explicit false
+        put(esp32cam_mock_af_supported, false),
+        ?assertEqual({error, unsupported}, safe_call(fun() -> esp32cam_mock:af_init([]) end)),
+        erase(esp32cam_mock_af_supported)
+    end).
+
+test_af_set_mode() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        put(esp32cam_mock_af_supported, true),
+        ok = safe_call(fun() -> esp32cam_mock:af_init([]) end),
+        ?assertEqual(ok, safe_call(fun() -> esp32cam_mock:af_set_mode(auto) end)),
+        ?assertEqual(ok, safe_call(fun() -> esp32cam_mock:af_set_mode(manual) end)),
+        ?assertEqual({error, badarg}, safe_call(fun() -> esp32cam_mock:af_set_mode(invalid) end)),
+        erase(esp32cam_mock_af_supported)
+    end).
+
+test_af_trigger_and_status() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        put(esp32cam_mock_af_supported, true),
+        ok = safe_call(fun() -> esp32cam_mock:af_init([]) end),
+        ?assertEqual(ok, safe_call(fun() -> esp32cam_mock:af_trigger() end)),
+        ?assertEqual(
+            {ok, #{busy => true, focused => false, raw => 0}},
+            safe_call(fun() -> esp32cam_mock:af_get_status() end)
+        ),
+        ?assertEqual(
+            {ok, #{busy => true, focused => false, raw => 0}}, esp32cam_mock:af_get_status()
+        ),
+        erase(esp32cam_mock_af_supported)
+    end).
+
+test_af_wait() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        put(esp32cam_mock_af_supported, true),
+        ok = safe_call(fun() -> esp32cam_mock:af_init([]) end),
+        ok = safe_call(fun() -> esp32cam_mock:af_trigger() end),
+        ?assertEqual(
+            {ok, #{busy => false, focused => true, raw => 0}},
+            safe_call(fun() -> esp32cam_mock:af_wait(2000) end)
+        ),
+        ?assertEqual(
+            {ok, #{busy => false, focused => true, raw => 0}},
+            safe_call(fun() -> esp32cam_mock:af_get_status() end)
+        ),
+        ?assertEqual({error, badarg}, safe_call(fun() -> esp32cam_mock:af_wait(-10) end)),
+        ?assertMatch({ok, _}, esp32cam_mock:af_wait(16#FFFFFFFF)),
+        ?assertEqual({error, badarg}, esp32cam_mock:af_wait(16#100000000)),
+        ?assertEqual({error, badarg}, esp32cam:af_wait(16#100000000)),
+        erase(esp32cam_mock_af_supported)
+    end).
+
+test_af_set_manual_position() ->
+    ?_test(begin
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        put(esp32cam_mock_af_supported, true),
+        ok = safe_call(fun() -> esp32cam_mock:af_init([]) end),
+        % 1. OV5640's unimplemented driver callback returns ESP_FAIL.
+        ?assertEqual({error, -1}, esp32cam_mock:af_set_manual_position(100)),
+        % 2. Supported
+        put(esp32cam_mock_af_manual_supported, true),
+        ?assertEqual(ok, safe_call(fun() -> esp32cam_mock:af_set_manual_position(100) end)),
+        ?assertEqual(ok, esp32cam_mock:af_set_manual_position(65535)),
+        ?assertEqual(
+            {error, badarg}, safe_call(fun() -> esp32cam_mock:af_set_manual_position(-50) end)
+        ),
+        ?assertEqual({error, badarg}, esp32cam_mock:af_set_manual_position(65536)),
+        erase(esp32cam_mock_af_manual_supported),
+        erase(esp32cam_mock_af_supported)
+    end).
+
+test_af_before_init() ->
+    ?_test(begin
+        % 1. Before camera init, all af calls should return {error, bad_state}
+        erase(esp32cam_current_board),
+        erase(esp32cam_mock_af_initialized),
+        ?assertEqual({error, bad_state}, safe_call(fun() -> esp32cam_mock:af_init([]) end)),
+        ?assertEqual({error, bad_state}, safe_call(fun() -> esp32cam_mock:af_set_mode(auto) end)),
+        ?assertEqual({error, bad_state}, safe_call(fun() -> esp32cam_mock:af_trigger() end)),
+        ?assertEqual({error, bad_state}, safe_call(fun() -> esp32cam_mock:af_get_status() end)),
+        ?assertEqual({error, bad_state}, safe_call(fun() -> esp32cam_mock:af_wait(1000) end)),
+        ?assertEqual(
+            {error, bad_state}, safe_call(fun() -> esp32cam_mock:af_set_manual_position(100) end)
+        ),
+
+        % 2. After camera init, but before AF init, all af calls (except af_init) should return {error, bad_state}
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        put(esp32cam_mock_af_supported, true),
+        ?assertEqual({error, bad_state}, safe_call(fun() -> esp32cam_mock:af_set_mode(auto) end)),
+        ?assertEqual({error, bad_state}, safe_call(fun() -> esp32cam_mock:af_trigger() end)),
+        ?assertEqual({error, bad_state}, safe_call(fun() -> esp32cam_mock:af_get_status() end)),
+        ?assertEqual({error, bad_state}, safe_call(fun() -> esp32cam_mock:af_wait(1000) end)),
+        ?assertEqual(
+            {error, bad_state}, safe_call(fun() -> esp32cam_mock:af_set_manual_position(100) end)
+        ),
+        erase(esp32cam_mock_af_supported)
+    end).
+
+test_af_reinitialization() ->
+    ?_test(begin
+        esp32cam_mock:start_mock_mode(),
+        ok = esp32cam_mock:init([{fb_count, 1}]),
+        put(esp32cam_mock_af_supported, true),
+        ok = esp32cam_mock:af_init([]),
+        {ok, Frame} = esp32cam_mock:capture_frame(),
+        % Rejected reconfiguration must preserve working AF.
+        ?assertEqual({error, frames_in_use}, esp32cam_mock:set_psram_mode(true)),
+        ?assertEqual(ok, esp32cam_mock:af_trigger()),
+        ok = esp32cam_mock:release_frame(Frame),
+        lists:foreach(
+            fun(Mode) ->
+                ok = esp32cam_mock:set_psram_mode(Mode),
+                ?assertEqual({error, bad_state}, esp32cam_mock:af_trigger()),
+                ok = esp32cam_mock:af_init([])
+            end,
+            [true, true, false]
+        ),
+        % Invalid AF config must not invalidate an already initialized driver.
+        ?assertMatch({error, _}, esp32cam_mock:af_init([{timeout_ms, -1}])),
+        ?assertEqual(ok, esp32cam_mock:af_trigger()),
+        esp32cam_mock:set_mock_behavior(always_error),
+        ?assertEqual({error, -1}, esp32cam_mock:af_init([])),
+        ?assertEqual({error, bad_state}, esp32cam_mock:af_trigger()),
+        esp32cam_mock:set_mock_behavior(default),
+        ok = esp32cam_mock:af_init([]),
+        ok = esp32cam_mock:init(),
+        ?assertEqual({error, bad_state}, esp32cam_mock:af_get_status()),
+        put(esp32cam_mock_af_supported, true),
+        ok = esp32cam_mock:af_init([]),
+        esp32cam_mock:set_mock_behavior(always_error),
+        ?assertMatch({error, _}, esp32cam_mock:set_psram_mode(false)),
+        ?assertEqual({error, bad_state}, esp32cam_mock:af_init([])),
+        esp32cam_mock:stop_mock_mode()
     end).
 
 %%====================================================================
