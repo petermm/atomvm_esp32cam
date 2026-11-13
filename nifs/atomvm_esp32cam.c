@@ -651,6 +651,38 @@ static const char *const contrast_a = "\x8"
                                       "contrast";
 static const char *const saturation_a = "\xA"
                                         "saturation";
+static const char *const ae_level_a = "\x8"
+                                      "ae_level";
+static const char *const exposure_ctrl_a = "\xD"
+                                           "exposure_ctrl";
+static const char *const aec2_a = "\x4"
+                                  "aec2";
+static const char *const aec_value_a = "\x9"
+                                       "aec_value";
+static const char *const gain_ctrl_a = "\x9"
+                                       "gain_ctrl";
+static const char *const agc_gain_a = "\x8"
+                                      "agc_gain";
+static const char *const gainceiling_a = "\xB"
+                                         "gainceiling";
+static const char *const sharpness_a = "\x9"
+                                       "sharpness";
+static const char *const denoise_a = "\x7"
+                                     "denoise";
+static const char *const gain_2x_a = "\x2"
+                                     "2x";
+static const char *const gain_4x_a = "\x2"
+                                     "4x";
+static const char *const gain_8x_a = "\x2"
+                                     "8x";
+static const char *const gain_16x_a = "\x3"
+                                      "16x";
+static const char *const gain_32x_a = "\x3"
+                                      "32x";
+static const char *const gain_64x_a = "\x3"
+                                      "64x";
+static const char *const gain_128x_a = "\x4"
+                                       "128x";
 static const char *const hmirror_a = "\x7"
                                      "hmirror";
 static const char *const vflip_a = "\x5"
@@ -1136,6 +1168,341 @@ static int apply_wb_mode(sensor_t *s, const wb_mode_config_t *wb, bool *out_unsu
     }
 }
 
+typedef struct {
+    bool is_set;
+    int value; // -100..100
+} level_control_t;
+
+static bool parse_level_control(term t, level_control_t *out)
+{
+    out->is_set = false;
+    out->value = 0;
+
+    if (term_is_nil(t)) {
+        return true;
+    }
+
+    if (term_is_any_integer(t)) {
+        avm_int_t val = term_to_int(t);
+        if (val < -100 || val > 100) {
+            return false;
+        }
+        out->is_set = true;
+        out->value = (int) val;
+        return true;
+    }
+
+    return false;
+}
+
+static bool parse_gainceiling(Context *ctx, term t, bool *out_set, int *out_val)
+{
+    *out_set = false;
+    *out_val = 0;
+
+    if (term_is_nil(t)) {
+        return true;
+    }
+
+    if (term_is_any_integer(t)) {
+        avm_int_t val = term_to_int(t);
+        if (val < 0 || val > 6) {
+            return false;
+        }
+        *out_set = true;
+        *out_val = (int) val;
+        return true;
+    }
+
+    if (t == globalcontext_make_atom(ctx->global, gain_2x_a)) {
+        *out_val = GAINCEILING_2X;
+    } else if (t == globalcontext_make_atom(ctx->global, gain_4x_a)) {
+        *out_val = GAINCEILING_4X;
+    } else if (t == globalcontext_make_atom(ctx->global, gain_8x_a)) {
+        *out_val = GAINCEILING_8X;
+    } else if (t == globalcontext_make_atom(ctx->global, gain_16x_a)) {
+        *out_val = GAINCEILING_16X;
+    } else if (t == globalcontext_make_atom(ctx->global, gain_32x_a)) {
+        *out_val = GAINCEILING_32X;
+    } else if (t == globalcontext_make_atom(ctx->global, gain_64x_a)) {
+        *out_val = GAINCEILING_64X;
+    } else if (t == globalcontext_make_atom(ctx->global, gain_128x_a)) {
+        *out_val = GAINCEILING_128X;
+    } else {
+        return false;
+    }
+    *out_set = true;
+    return true;
+}
+
+typedef struct {
+    int reg;
+    int mask;
+    int val;
+} reg_write_op_t;
+
+static int apply_reg_ops(sensor_t *s, const reg_write_op_t *ops, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        int err = s->set_reg(s, ops[i].reg, ops[i].mask, ops[i].val);
+        if (err != 0) {
+            return err;
+        }
+    }
+    return 0;
+}
+
+static int apply_brightness(sensor_t *s, const level_control_t *ctrl, bool *out_unsupported)
+{
+    *out_unsupported = false;
+    if (!ctrl->is_set) {
+        return 0;
+    }
+    if (s->set_reg == NULL) {
+        *out_unsupported = true;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    int lvl = ctrl->value;
+    switch (s->id.PID) {
+        case OV2640_PID: {
+            int y_off = 32 + (lvl * 32) / 100;
+            const reg_write_op_t ops[] = {
+                { 0x007C, 0xFF, 0x00 },
+                { 0x007D, 0xFF, 0x04 },
+                { 0x007C, 0xFF, 0x09 },
+                { 0x007D, 0xFF, y_off },
+                { 0x007D, 0xFF, 0x00 }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        case OV3660_PID:
+        case OV5640_PID: {
+            int mag = ((lvl < 0 ? -lvl : lvl) * 64 + 50) / 100;
+            int sign = (lvl < 0) ? 0x08 : 0x00;
+            const reg_write_op_t ops[] = {
+                { 0x5587, 0xFF, mag },
+                { 0x5588, 0x08, sign }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        case GC0308_PID: {
+            int target = 0x48 + (lvl * 32) / 100;
+            const reg_write_op_t ops[] = {
+                { 0x00FE, 0xFF, 0x00 },
+                { 0x00D3, 0xFF, target }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        default:
+            *out_unsupported = true;
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
+static int apply_contrast(sensor_t *s, const level_control_t *ctrl, bool *out_unsupported)
+{
+    *out_unsupported = false;
+    if (!ctrl->is_set) {
+        return 0;
+    }
+    if (s->set_reg == NULL) {
+        *out_unsupported = true;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    int lvl = ctrl->value;
+    switch (s->id.PID) {
+        case OV2640_PID: {
+            int slope = 32 + (lvl * 8) / 100;
+            int offset = 32 - (lvl * 20) / 100;
+            const reg_write_op_t ops[] = {
+                { 0x007C, 0xFF, 0x00 },
+                { 0x007D, 0xFF, 0x04 },
+                { 0x007C, 0xFF, 0x07 },
+                { 0x007D, 0xFF, 0x20 },
+                { 0x007D, 0xFF, slope },
+                { 0x007D, 0xFF, offset },
+                { 0x007D, 0xFF, 0x06 }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        case OV3660_PID:
+        case OV5640_PID: {
+            int val = 32 + (lvl * 24) / 100;
+            return s->set_reg(s, 0x5586, 0xFF, val);
+        }
+        case GC0308_PID: {
+            int val = 64 + (lvl * 32) / 100;
+            const reg_write_op_t ops[] = {
+                { 0x00FE, 0xFF, 0x00 },
+                { 0x00B3, 0xFF, val }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        default:
+            *out_unsupported = true;
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
+static int apply_saturation(sensor_t *s, const level_control_t *ctrl, bool *out_unsupported)
+{
+    *out_unsupported = false;
+    if (!ctrl->is_set) {
+        return 0;
+    }
+    if (s->set_reg == NULL) {
+        *out_unsupported = true;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    int lvl = ctrl->value;
+    switch (s->id.PID) {
+        case OV2640_PID: {
+            int sat = 72 + (lvl * 48) / 100;
+            const reg_write_op_t ops[] = {
+                { 0x007C, 0xFF, 0x00 },
+                { 0x007D, 0xFF, 0x02 },
+                { 0x007C, 0xFF, 0x03 },
+                { 0x007D, 0xFF, sat },
+                { 0x007D, 0xFF, sat }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        case OV3660_PID:
+        case OV5640_PID: {
+            static const int neutral[6] = { 12, 120, 132, 125, 107, 18 };
+            const reg_write_op_t ops[] = {
+                { 0x5381, 0xFF, 0x1D },
+                { 0x5382, 0xFF, 0x60 },
+                { 0x5383, 0xFF, 0x03 },
+                { 0x5384, 0xFF, (neutral[0] * (200 + lvl) + 100) / 200 },
+                { 0x5385, 0xFF, (neutral[1] * (200 + lvl) + 100) / 200 },
+                { 0x5386, 0xFF, (neutral[2] * (200 + lvl) + 100) / 200 },
+                { 0x5387, 0xFF, (neutral[3] * (200 + lvl) + 100) / 200 },
+                { 0x5388, 0xFF, (neutral[4] * (200 + lvl) + 100) / 200 },
+                { 0x5389, 0xFF, (neutral[5] * (200 + lvl) + 100) / 200 },
+                { 0x538A, 0xFF, 0x01 },
+                { 0x538B, 0xFF, 0x98 }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        case GC0308_PID: {
+            int sat = 64 + (lvl * 32) / 100;
+            const reg_write_op_t ops[] = {
+                { 0x00FE, 0xFF, 0x00 },
+                { 0x00B1, 0xFF, sat },
+                { 0x00B2, 0xFF, sat }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        default:
+            *out_unsupported = true;
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
+static int apply_ae_level(sensor_t *s, const level_control_t *ctrl, bool *out_unsupported)
+{
+    *out_unsupported = false;
+    if (!ctrl->is_set) {
+        return 0;
+    }
+    if (s->set_reg == NULL) {
+        *out_unsupported = true;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    int lvl = ctrl->value;
+    switch (s->id.PID) {
+        case OV2640_PID: {
+            int aew = 62 + (lvl * 28) / 100;
+            int aeb = 56 + (lvl * 28) / 100;
+            int vv = (((aew + 16) >> 4) << 4) | ((aeb >> 4) & 0x0F);
+            const reg_write_op_t ops[] = {
+                { 0x0124, 0xFF, aew },
+                { 0x0125, 0xFF, aeb },
+                { 0x0126, 0xFF, vv }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        case OV3660_PID:
+        case OV5640_PID: {
+            int target = 55 + (lvl * 50) / 100;
+            int low = target * 23 / 25;
+            int high = target * 27 / 25;
+            int fast_low = low >> 1;
+            int fast_high = (high << 1) > 255 ? 255 : (high << 1);
+            const reg_write_op_t ops[] = {
+                { 0x3A0F, 0xFF, high },
+                { 0x3A10, 0xFF, low },
+                { 0x3A1B, 0xFF, high },
+                { 0x3A1E, 0xFF, low },
+                { 0x3A11, 0xFF, fast_high },
+                { 0x3A1F, 0xFF, fast_low }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        case GC0308_PID: {
+            int target = 0x48 + (lvl * 32) / 100;
+            const reg_write_op_t ops[] = {
+                { 0x00FE, 0xFF, 0x00 },
+                { 0x00D3, 0xFF, target }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        default:
+            *out_unsupported = true;
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
+static int apply_sharpness(sensor_t *s, const level_control_t *ctrl, bool *out_unsupported)
+{
+    *out_unsupported = false;
+    if (!ctrl->is_set) {
+        return 0;
+    }
+    if (s->set_reg == NULL) {
+        *out_unsupported = true;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    int lvl = ctrl->value;
+    switch (s->id.PID) {
+        case OV3660_PID:
+        case OV5640_PID: {
+            int mt2 = 24 + (lvl * 24) / 100;
+            int mt1 = mt2 + 1;
+            const reg_write_op_t ops[] = {
+                { 0x5308, 0x40, 0x00 },
+                { 0x5300, 0xFF, 0x10 },
+                { 0x5301, 0xFF, 0x10 },
+                { 0x5302, 0xFF, mt1 },
+                { 0x5303, 0xFF, mt2 },
+                { 0x5309, 0xFF, 0x10 },
+                { 0x530A, 0xFF, 0x10 },
+                { 0x530B, 0xFF, 0x04 },
+                { 0x530C, 0xFF, 0x06 }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        case GC0308_PID: {
+            int delta = (lvl * 16) / 100;
+            const reg_write_op_t ops[] = {
+                { 0x00FE, 0xFF, 0x00 },
+                { 0x0077, 0xFF, 0x38 + delta },
+                { 0x0078, 0xFF, 0x88 + delta }
+            };
+            return apply_reg_ops(s, ops, sizeof(ops) / sizeof(ops[0]));
+        }
+        default:
+            *out_unsupported = true;
+            return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
 static camera_config_t *create_camera_config(const board_config_t *board_config, framesize_t frame_size, int jpeg_quality,
     int pixel_format, int xclk_freq_hz, int fb_count,
     int fb_location, int grab_mode, int sccb_i2c_port, int ledc_timer, int ledc_channel, int conv_mode)
@@ -1502,52 +1869,125 @@ static term nif_esp32cam_apply_config_locked(Context *ctx, int argc, term argv[]
         RAISE_ERROR(BADARG_ATOM);
     }
 
-    bool brightness_set = false;
-    int brightness = 0;
-    term brightness_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, brightness_a));
-    if (!term_is_nil(brightness_term)) {
-        if (!term_is_any_integer(brightness_term)) {
-            ESP_LOGE(TAG, "Invalid brightness parameter");
-            RAISE_ERROR(BADARG_ATOM);
-        }
-        brightness = term_to_int(brightness_term);
-        if (brightness < -2 || brightness > 2) {
-            ESP_LOGE(TAG, "Invalid brightness parameter range");
-            RAISE_ERROR(BADARG_ATOM);
-        }
-        brightness_set = true;
+    level_control_t brightness_cfg;
+    if (!parse_level_control(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, brightness_a)), &brightness_cfg)) {
+        ESP_LOGE(TAG, "Invalid brightness parameter");
+        RAISE_ERROR(BADARG_ATOM);
     }
 
-    bool contrast_set = false;
-    int contrast = 0;
-    term contrast_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, contrast_a));
-    if (!term_is_nil(contrast_term)) {
-        if (!term_is_any_integer(contrast_term)) {
-            ESP_LOGE(TAG, "Invalid contrast parameter");
-            RAISE_ERROR(BADARG_ATOM);
-        }
-        contrast = term_to_int(contrast_term);
-        if (contrast < -2 || contrast > 2) {
-            ESP_LOGE(TAG, "Invalid contrast parameter range");
-            RAISE_ERROR(BADARG_ATOM);
-        }
-        contrast_set = true;
+    level_control_t contrast_cfg;
+    if (!parse_level_control(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, contrast_a)), &contrast_cfg)) {
+        ESP_LOGE(TAG, "Invalid contrast parameter");
+        RAISE_ERROR(BADARG_ATOM);
     }
 
-    bool saturation_set = false;
-    int saturation = 0;
-    term saturation_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, saturation_a));
-    if (!term_is_nil(saturation_term)) {
-        if (!term_is_any_integer(saturation_term)) {
-            ESP_LOGE(TAG, "Invalid saturation parameter");
+    level_control_t saturation_cfg;
+    if (!parse_level_control(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, saturation_a)), &saturation_cfg)) {
+        ESP_LOGE(TAG, "Invalid saturation parameter");
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    level_control_t ae_level_cfg;
+    if (!parse_level_control(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, ae_level_a)), &ae_level_cfg)) {
+        ESP_LOGE(TAG, "Invalid ae_level parameter");
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    level_control_t sharpness_cfg;
+    if (!parse_level_control(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, sharpness_a)), &sharpness_cfg)) {
+        ESP_LOGE(TAG, "Invalid sharpness parameter");
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    int exposure_ctrl = INVALID_CONFIG_VALUE;
+    term exposure_ctrl_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, exposure_ctrl_a));
+    if (!term_is_nil(exposure_ctrl_term)) {
+        if (exposure_ctrl_term == TRUE_ATOM) {
+            exposure_ctrl = 1;
+        } else if (exposure_ctrl_term == FALSE_ATOM) {
+            exposure_ctrl = 0;
+        } else {
+            ESP_LOGE(TAG, "Invalid exposure_ctrl parameter");
             RAISE_ERROR(BADARG_ATOM);
         }
-        saturation = term_to_int(saturation_term);
-        if (saturation < -2 || saturation > 2) {
-            ESP_LOGE(TAG, "Invalid saturation parameter range");
+    }
+
+    int aec2 = INVALID_CONFIG_VALUE;
+    term aec2_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, aec2_a));
+    if (!term_is_nil(aec2_term)) {
+        if (aec2_term == TRUE_ATOM) {
+            aec2 = 1;
+        } else if (aec2_term == FALSE_ATOM) {
+            aec2 = 0;
+        } else {
+            ESP_LOGE(TAG, "Invalid aec2 parameter");
             RAISE_ERROR(BADARG_ATOM);
         }
-        saturation_set = true;
+    }
+
+    bool aec_value_set = false;
+    int aec_value = 0;
+    term aec_value_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, aec_value_a));
+    if (!term_is_nil(aec_value_term)) {
+        if (!term_is_any_integer(aec_value_term)) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        avm_int_t v = term_to_int(aec_value_term);
+        if (v < 0 || v > 1200) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        aec_value = (int) v;
+        aec_value_set = true;
+    }
+
+    int gain_ctrl = INVALID_CONFIG_VALUE;
+    term gain_ctrl_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, gain_ctrl_a));
+    if (!term_is_nil(gain_ctrl_term)) {
+        if (gain_ctrl_term == TRUE_ATOM) {
+            gain_ctrl = 1;
+        } else if (gain_ctrl_term == FALSE_ATOM) {
+            gain_ctrl = 0;
+        } else {
+            ESP_LOGE(TAG, "Invalid gain_ctrl parameter");
+            RAISE_ERROR(BADARG_ATOM);
+        }
+    }
+
+    bool agc_gain_set = false;
+    int agc_gain = 0;
+    term agc_gain_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, agc_gain_a));
+    if (!term_is_nil(agc_gain_term)) {
+        if (!term_is_any_integer(agc_gain_term)) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        avm_int_t v = term_to_int(agc_gain_term);
+        if (v < 0 || v > 64) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        agc_gain = (int) v;
+        agc_gain_set = true;
+    }
+
+    bool gainceiling_set = false;
+    int gainceiling = 0;
+    if (!parse_gainceiling(ctx, interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, gainceiling_a)), &gainceiling_set, &gainceiling)) {
+        ESP_LOGE(TAG, "Invalid gainceiling parameter");
+        RAISE_ERROR(BADARG_ATOM);
+    }
+
+    bool denoise_set = false;
+    int denoise = 0;
+    term denoise_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, denoise_a));
+    if (!term_is_nil(denoise_term)) {
+        if (!term_is_any_integer(denoise_term)) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        avm_int_t v = term_to_int(denoise_term);
+        if (v < 0 || v > 8) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        denoise = (int) v;
+        denoise_set = true;
     }
 
     int hmirror = INVALID_CONFIG_VALUE;
@@ -1643,7 +2083,7 @@ static term nif_esp32cam_apply_config_locked(Context *ctx, int argc, term argv[]
     sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
         int sensor_err = 0;
-        bool wb_unsupported = false;
+        bool ctrl_unsupported = false;
         if (auto_white_balance != INVALID_CONFIG_VALUE) {
             sensor_err = s->set_whitebal != NULL
                 ? s->set_whitebal(s, auto_white_balance)
@@ -1655,21 +2095,56 @@ static term nif_esp32cam_apply_config_locked(Context *ctx, int argc, term argv[]
                 : ESP_FAIL;
         }
         if (sensor_err == 0 && wb_mode_cfg.is_set) {
-            sensor_err = apply_wb_mode(s, &wb_mode_cfg, &wb_unsupported);
+            sensor_err = apply_wb_mode(s, &wb_mode_cfg, &ctrl_unsupported);
         }
-        if (sensor_err == 0 && brightness_set) {
-            sensor_err = s->set_brightness != NULL
-                ? s->set_brightness(s, brightness)
+        if (sensor_err == 0 && brightness_cfg.is_set) {
+            sensor_err = apply_brightness(s, &brightness_cfg, &ctrl_unsupported);
+        }
+        if (sensor_err == 0 && contrast_cfg.is_set) {
+            sensor_err = apply_contrast(s, &contrast_cfg, &ctrl_unsupported);
+        }
+        if (sensor_err == 0 && saturation_cfg.is_set) {
+            sensor_err = apply_saturation(s, &saturation_cfg, &ctrl_unsupported);
+        }
+        if (sensor_err == 0 && ae_level_cfg.is_set) {
+            sensor_err = apply_ae_level(s, &ae_level_cfg, &ctrl_unsupported);
+        }
+        if (sensor_err == 0 && sharpness_cfg.is_set) {
+            sensor_err = apply_sharpness(s, &sharpness_cfg, &ctrl_unsupported);
+        }
+        if (sensor_err == 0 && exposure_ctrl != INVALID_CONFIG_VALUE) {
+            sensor_err = s->set_exposure_ctrl != NULL
+                ? s->set_exposure_ctrl(s, exposure_ctrl)
                 : ESP_FAIL;
         }
-        if (sensor_err == 0 && contrast_set) {
-            sensor_err = s->set_contrast != NULL
-                ? s->set_contrast(s, contrast)
+        if (sensor_err == 0 && aec2 != INVALID_CONFIG_VALUE) {
+            sensor_err = s->set_aec2 != NULL
+                ? s->set_aec2(s, aec2)
                 : ESP_FAIL;
         }
-        if (sensor_err == 0 && saturation_set) {
-            sensor_err = s->set_saturation != NULL
-                ? s->set_saturation(s, saturation)
+        if (sensor_err == 0 && aec_value_set) {
+            sensor_err = s->set_aec_value != NULL
+                ? s->set_aec_value(s, aec_value)
+                : ESP_FAIL;
+        }
+        if (sensor_err == 0 && gain_ctrl != INVALID_CONFIG_VALUE) {
+            sensor_err = s->set_gain_ctrl != NULL
+                ? s->set_gain_ctrl(s, gain_ctrl)
+                : ESP_FAIL;
+        }
+        if (sensor_err == 0 && agc_gain_set) {
+            sensor_err = s->set_agc_gain != NULL
+                ? s->set_agc_gain(s, agc_gain)
+                : ESP_FAIL;
+        }
+        if (sensor_err == 0 && gainceiling_set) {
+            sensor_err = s->set_gainceiling != NULL
+                ? s->set_gainceiling(s, (gainceiling_t) gainceiling)
+                : ESP_FAIL;
+        }
+        if (sensor_err == 0 && denoise_set) {
+            sensor_err = s->set_denoise != NULL
+                ? s->set_denoise(s, denoise)
                 : ESP_FAIL;
         }
         if (sensor_err == 0 && hmirror != INVALID_CONFIG_VALUE) {
@@ -1692,13 +2167,16 @@ static term nif_esp32cam_apply_config_locked(Context *ctx, int argc, term argv[]
             if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
                 RAISE_ERROR(MEMORY_ATOM);
             }
-            if (wb_unsupported) {
+            if (ctrl_unsupported) {
                 return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
             }
             return port_create_error_tuple(ctx, term_from_int28(sensor_err));
         }
     } else if (auto_white_balance != INVALID_CONFIG_VALUE || awb_gain != INVALID_CONFIG_VALUE || wb_mode_cfg.is_set
-        || brightness_set || contrast_set || saturation_set
+        || brightness_cfg.is_set || contrast_cfg.is_set || saturation_cfg.is_set
+        || ae_level_cfg.is_set || sharpness_cfg.is_set
+        || exposure_ctrl != INVALID_CONFIG_VALUE || aec2 != INVALID_CONFIG_VALUE || aec_value_set
+        || gain_ctrl != INVALID_CONFIG_VALUE || agc_gain_set || gainceiling_set || denoise_set
         || hmirror != INVALID_CONFIG_VALUE || vflip != INVALID_CONFIG_VALUE) {
         ESP_LOGW(TAG, "Could not get sensor pointer to apply camera settings");
         deinit_camera_and_reset_xclk(selected_board_config->pin_xclk);
@@ -1841,14 +2319,14 @@ static term nif_esp32cam_set_control_locked(Context *ctx, int argc, term argv[])
     term control = argv[0];
     term value = argv[1];
     int sensor_err = ESP_FAIL;
-    bool wb_unsupported = false;
+    bool ctrl_unsupported = false;
 
     if (control == globalcontext_make_atom(ctx->global, wb_mode_a)) {
         wb_mode_config_t wb_mode_cfg;
         if (!parse_wb_mode(ctx, value, &wb_mode_cfg) || !wb_mode_cfg.is_set) {
             RAISE_ERROR(BADARG_ATOM);
         }
-        sensor_err = apply_wb_mode(s, &wb_mode_cfg, &wb_unsupported);
+        sensor_err = apply_wb_mode(s, &wb_mode_cfg, &ctrl_unsupported);
     } else if (control == globalcontext_make_atom(ctx->global, auto_white_balance_a)) {
         if (value != TRUE_ATOM && value != FALSE_ATOM) {
             RAISE_ERROR(BADARG_ATOM);
@@ -1864,37 +2342,97 @@ static term nif_esp32cam_set_control_locked(Context *ctx, int argc, term argv[])
             sensor_err = s->set_awb_gain(s, value == TRUE_ATOM);
         }
     } else if (control == globalcontext_make_atom(ctx->global, brightness_a)) {
-        if (!term_is_any_integer(value)) {
+        level_control_t ctrl;
+        if (!parse_level_control(value, &ctrl) || !ctrl.is_set) {
             RAISE_ERROR(BADARG_ATOM);
         }
-        avm_int_t val = term_to_int(value);
-        if (val < -2 || val > 2) {
-            RAISE_ERROR(BADARG_ATOM);
-        }
-        if (s->set_brightness != NULL) {
-            sensor_err = s->set_brightness(s, val);
-        }
+        sensor_err = apply_brightness(s, &ctrl, &ctrl_unsupported);
     } else if (control == globalcontext_make_atom(ctx->global, contrast_a)) {
-        if (!term_is_any_integer(value)) {
+        level_control_t ctrl;
+        if (!parse_level_control(value, &ctrl) || !ctrl.is_set) {
             RAISE_ERROR(BADARG_ATOM);
         }
-        avm_int_t val = term_to_int(value);
-        if (val < -2 || val > 2) {
-            RAISE_ERROR(BADARG_ATOM);
-        }
-        if (s->set_contrast != NULL) {
-            sensor_err = s->set_contrast(s, val);
-        }
+        sensor_err = apply_contrast(s, &ctrl, &ctrl_unsupported);
     } else if (control == globalcontext_make_atom(ctx->global, saturation_a)) {
+        level_control_t ctrl;
+        if (!parse_level_control(value, &ctrl) || !ctrl.is_set) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        sensor_err = apply_saturation(s, &ctrl, &ctrl_unsupported);
+    } else if (control == globalcontext_make_atom(ctx->global, ae_level_a)) {
+        level_control_t ctrl;
+        if (!parse_level_control(value, &ctrl) || !ctrl.is_set) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        sensor_err = apply_ae_level(s, &ctrl, &ctrl_unsupported);
+    } else if (control == globalcontext_make_atom(ctx->global, sharpness_a)) {
+        level_control_t ctrl;
+        if (!parse_level_control(value, &ctrl) || !ctrl.is_set) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        sensor_err = apply_sharpness(s, &ctrl, &ctrl_unsupported);
+    } else if (control == globalcontext_make_atom(ctx->global, exposure_ctrl_a)) {
+        if (value != TRUE_ATOM && value != FALSE_ATOM) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        if (s->set_exposure_ctrl != NULL) {
+            sensor_err = s->set_exposure_ctrl(s, value == TRUE_ATOM ? 1 : 0);
+        }
+    } else if (control == globalcontext_make_atom(ctx->global, aec2_a)) {
+        if (value != TRUE_ATOM && value != FALSE_ATOM) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        if (s->set_aec2 != NULL) {
+            sensor_err = s->set_aec2(s, value == TRUE_ATOM ? 1 : 0);
+        }
+    } else if (control == globalcontext_make_atom(ctx->global, aec_value_a)) {
         if (!term_is_any_integer(value)) {
             RAISE_ERROR(BADARG_ATOM);
         }
         avm_int_t val = term_to_int(value);
-        if (val < -2 || val > 2) {
+        if (val < 0 || val > 1200) {
             RAISE_ERROR(BADARG_ATOM);
         }
-        if (s->set_saturation != NULL) {
-            sensor_err = s->set_saturation(s, val);
+        if (s->set_aec_value != NULL) {
+            sensor_err = s->set_aec_value(s, val);
+        }
+    } else if (control == globalcontext_make_atom(ctx->global, gain_ctrl_a)) {
+        if (value != TRUE_ATOM && value != FALSE_ATOM) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        if (s->set_gain_ctrl != NULL) {
+            sensor_err = s->set_gain_ctrl(s, value == TRUE_ATOM ? 1 : 0);
+        }
+    } else if (control == globalcontext_make_atom(ctx->global, agc_gain_a)) {
+        if (!term_is_any_integer(value)) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        avm_int_t val = term_to_int(value);
+        if (val < 0 || val > 64) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        if (s->set_agc_gain != NULL) {
+            sensor_err = s->set_agc_gain(s, val);
+        }
+    } else if (control == globalcontext_make_atom(ctx->global, gainceiling_a)) {
+        bool gc_set = false;
+        int gc_val = 0;
+        if (!parse_gainceiling(ctx, value, &gc_set, &gc_val) || !gc_set) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        if (s->set_gainceiling != NULL) {
+            sensor_err = s->set_gainceiling(s, (gainceiling_t) gc_val);
+        }
+    } else if (control == globalcontext_make_atom(ctx->global, denoise_a)) {
+        if (!term_is_any_integer(value)) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        avm_int_t val = term_to_int(value);
+        if (val < 0 || val > 8) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        if (s->set_denoise != NULL) {
+            sensor_err = s->set_denoise(s, val);
         }
     } else if (control == globalcontext_make_atom(ctx->global, hmirror_a)) {
         if (value != TRUE_ATOM && value != FALSE_ATOM) {
@@ -1919,7 +2457,7 @@ static term nif_esp32cam_set_control_locked(Context *ctx, int argc, term argv[])
         if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
             RAISE_ERROR(MEMORY_ATOM);
         }
-        if (wb_unsupported) {
+        if (ctrl_unsupported) {
             return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, unsupported_a));
         }
         return port_create_error_tuple(ctx, term_from_int28(sensor_err));

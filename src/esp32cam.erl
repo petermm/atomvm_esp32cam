@@ -60,7 +60,9 @@
     af_set_manual_position/1,
     af_set_manual_position_nif/1,
     validate_af_config/1,
-    is_valid_wb_mode/1
+    is_valid_wb_mode/1,
+    is_valid_level_control/1,
+    is_valid_gainceiling/1
 ]).
 
 -define(SUPPORTED_BOARDS, [
@@ -175,9 +177,18 @@
     | {auto_white_balance, boolean()}
     | {awb_gain, boolean()}
     | {wb_mode, wb_mode()}
-    | {brightness, -2..2}
-    | {contrast, -2..2}
-    | {saturation, -2..2}
+    | {brightness, level_control()}
+    | {contrast, level_control()}
+    | {saturation, level_control()}
+    | {ae_level, level_control()}
+    | {sharpness, level_control()}
+    | {exposure_ctrl, boolean()}
+    | {aec2, boolean()}
+    | {aec_value, 0..1200}
+    | {gain_ctrl, boolean()}
+    | {agc_gain, 0..64}
+    | {gainceiling, gainceiling()}
+    | {denoise, 0..8}
     | {hmirror, boolean()}
     | {vflip, boolean()}
     | {pin_pwdn, integer()}
@@ -202,12 +213,30 @@
 -type wb_gain() :: 0..255.
 -type wb_mode() ::
     auto | sunny | cloudy | office | home | {custom, wb_gain(), wb_gain(), wb_gain()}.
+-type level_control() :: -100..100.
+-type gainceiling() :: '2x' | '4x' | '8x' | '16x' | '32x' | '64x' | '128x' | 0..6.
 -type capture_param() :: {flash, on | off} | {flash_delay_ms, non_neg_integer()}.
 -type capture_params() :: [capture_param()].
 -type flash_options() :: [{delay_ms, non_neg_integer()}].
 -type control() ::
-    wb_mode | auto_white_balance | awb_gain | brightness | contrast | saturation | hmirror | vflip.
--type control_value() :: wb_mode() | boolean() | -2..2.
+    wb_mode
+    | auto_white_balance
+    | awb_gain
+    | brightness
+    | contrast
+    | saturation
+    | ae_level
+    | sharpness
+    | exposure_ctrl
+    | aec2
+    | aec_value
+    | gain_ctrl
+    | agc_gain
+    | gainceiling
+    | denoise
+    | hmirror
+    | vflip.
+-type control_value() :: wb_mode() | level_control() | gainceiling() | boolean() | 0..1200.
 -type image() :: binary().
 -opaque frame() :: term().
 -export_type([frame/0]).
@@ -567,6 +596,40 @@ is_valid_wb_mode({custom, R, G, B}) when
 is_valid_wb_mode(_) ->
     false.
 
+%%-----------------------------------------------------------------------------
+%% @param   Value `-100..100' integer level
+%% @returns `true' if `Value' is a valid level control, `false' otherwise.
+%% @doc     Validate a `-100..100' level control value.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec is_valid_level_control(Value :: term()) -> boolean().
+is_valid_level_control(Value) when is_integer(Value), Value >= -100, Value =< 100 ->
+    true;
+is_valid_level_control(_) ->
+    false.
+
+%%-----------------------------------------------------------------------------
+%% @param   Value gainceiling atom (`'2x'..'128x'`) or integer (`0..6')
+%% @returns `true' if `Value' is a valid gainceiling setting, `false' otherwise.
+%% @doc     Validate a sensor gain ceiling setting.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec is_valid_gainceiling(Value :: term()) -> boolean().
+is_valid_gainceiling(Value) when is_integer(Value), Value >= 0, Value =< 6 ->
+    true;
+is_valid_gainceiling(Value) when
+    Value =:= '2x';
+    Value =:= '4x';
+    Value =:= '8x';
+    Value =:= '16x';
+    Value =:= '32x';
+    Value =:= '64x';
+    Value =:= '128x'
+->
+    true;
+is_valid_gainceiling(_) ->
+    false.
+
 validate_control(wb_mode, Value) ->
     case is_valid_wb_mode(Value) of
         true -> ok;
@@ -576,11 +639,34 @@ validate_control(auto_white_balance, Value) when is_boolean(Value) ->
     ok;
 validate_control(awb_gain, Value) when is_boolean(Value) ->
     ok;
-validate_control(brightness, Value) when is_integer(Value), Value >= -2, Value =< 2 ->
+validate_control(Control, Value) when
+    Control =:= brightness;
+    Control =:= contrast;
+    Control =:= saturation;
+    Control =:= ae_level;
+    Control =:= sharpness
+->
+    case is_valid_level_control(Value) of
+        true -> ok;
+        false -> {error, badarg}
+    end;
+validate_control(Control, Value) when
+    Control =:= exposure_ctrl; Control =:= aec2; Control =:= gain_ctrl
+->
+    case is_boolean(Value) of
+        true -> ok;
+        false -> {error, badarg}
+    end;
+validate_control(aec_value, Value) when is_integer(Value), Value >= 0, Value =< 1200 ->
     ok;
-validate_control(contrast, Value) when is_integer(Value), Value >= -2, Value =< 2 ->
+validate_control(agc_gain, Value) when is_integer(Value), Value >= 0, Value =< 64 ->
     ok;
-validate_control(saturation, Value) when is_integer(Value), Value >= -2, Value =< 2 ->
+validate_control(gainceiling, Value) ->
+    case is_valid_gainceiling(Value) of
+        true -> ok;
+        false -> {error, badarg}
+    end;
+validate_control(denoise, Value) when is_integer(Value), Value >= 0, Value =< 8 ->
     ok;
 validate_control(hmirror, Value) when is_boolean(Value) ->
     ok;
@@ -957,6 +1043,15 @@ validate_init_config(Config) when is_list(Config) ->
     Brightness = proplists:get_value(brightness, Config, 0),
     Contrast = proplists:get_value(contrast, Config, 0),
     Saturation = proplists:get_value(saturation, Config, 0),
+    AeLevel = proplists:get_value(ae_level, Config, 0),
+    Sharpness = proplists:get_value(sharpness, Config, 0),
+    ExposureCtrl = proplists:get_value(exposure_ctrl, Config, true),
+    Aec2 = proplists:get_value(aec2, Config, false),
+    AecValue = proplists:get_value(aec_value, Config, 0),
+    GainCtrl = proplists:get_value(gain_ctrl, Config, true),
+    AgcGain = proplists:get_value(agc_gain, Config, 0),
+    Gainceiling = proplists:get_value(gainceiling, Config, '2x'),
+    Denoise = proplists:get_value(denoise, Config, 0),
     Hmirror = proplists:get_value(hmirror, Config, false),
     Vflip = proplists:get_value(vflip, Config, false),
     case
@@ -1000,17 +1095,26 @@ validate_init_config(Config) when is_list(Config) ->
             {is_boolean(AutoWhiteBalance), {invalid_auto_white_balance, AutoWhiteBalance}},
             {is_boolean(AwbGain), {invalid_awb_gain, AwbGain}},
             {is_valid_wb_mode(WbMode), {invalid_wb_mode, WbMode}},
+            {is_valid_level_control(Brightness), {invalid_brightness, Brightness}},
+            {is_valid_level_control(Contrast), {invalid_contrast, Contrast}},
+            {is_valid_level_control(Saturation), {invalid_saturation, Saturation}},
+            {is_valid_level_control(AeLevel), {invalid_ae_level, AeLevel}},
+            {is_valid_level_control(Sharpness), {invalid_sharpness, Sharpness}},
+            {is_boolean(ExposureCtrl), {invalid_exposure_ctrl, ExposureCtrl}},
+            {is_boolean(Aec2), {invalid_aec2, Aec2}},
             {
-                is_integer(Brightness) andalso Brightness >= -2 andalso Brightness =< 2,
-                {invalid_brightness, Brightness}
+                is_integer(AecValue) andalso AecValue >= 0 andalso AecValue =< 1200,
+                {invalid_aec_value, AecValue}
             },
+            {is_boolean(GainCtrl), {invalid_gain_ctrl, GainCtrl}},
             {
-                is_integer(Contrast) andalso Contrast >= -2 andalso Contrast =< 2,
-                {invalid_contrast, Contrast}
+                is_integer(AgcGain) andalso AgcGain >= 0 andalso AgcGain =< 64,
+                {invalid_agc_gain, AgcGain}
             },
+            {is_valid_gainceiling(Gainceiling), {invalid_gainceiling, Gainceiling}},
             {
-                is_integer(Saturation) andalso Saturation >= -2 andalso Saturation =< 2,
-                {invalid_saturation, Saturation}
+                is_integer(Denoise) andalso Denoise >= 0 andalso Denoise =< 8,
+                {invalid_denoise, Denoise}
             },
             {is_boolean(Hmirror), {invalid_hmirror, Hmirror}},
             {is_boolean(Vflip), {invalid_vflip, Vflip}}

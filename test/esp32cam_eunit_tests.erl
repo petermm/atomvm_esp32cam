@@ -39,7 +39,9 @@ esp32cam_test_() ->
                 fun test_set_white_balance_controls/0,
                 fun test_set_control_invalid_values/0,
                 fun test_set_control_before_init/0,
-                test_custom_wb_gains()
+                test_custom_wb_gains(),
+                test_fine_level_controls(),
+                test_exposure_gain_image_controls()
             ]},
             {"Flash Tests", [
                 fun test_flash_capture_basic/0,
@@ -348,8 +350,8 @@ test_set_control_invalid_values() ->
         ?assertEqual({error, badarg}, esp32cam_mock:set_control(auto_white_balance, sunny)),
         ?assertEqual({error, badarg}, esp32cam_mock:set_control(awb_gain, enabled)),
         ?assertEqual({error, badarg}, esp32cam_mock:set_control(unknown, true)),
-        ?assertEqual({error, badarg}, esp32cam_mock:set_control(brightness, -3)),
-        ?assertEqual({error, badarg}, esp32cam_mock:set_control(brightness, 3)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(brightness, -101)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(brightness, 101)),
         ?assertEqual({error, badarg}, esp32cam_mock:set_control(contrast, 1.5)),
         ?assertEqual({error, badarg}, esp32cam_mock:set_control(saturation, high)),
         ?assertEqual({error, badarg}, esp32cam_mock:set_control(hmirror, 1)),
@@ -443,6 +445,149 @@ test_custom_wb_gains() ->
 
         erase(esp32cam_mock_sensor_pid),
         ok = esp32cam_mock:init()
+    end).
+
+test_fine_level_controls() ->
+    ?_test(begin
+        erase(esp32cam_mock_sensor_pid),
+
+        % 1. Init and reconfigure with -100..100 level controls
+        ?assertEqual(
+            ok,
+            esp32cam_mock:init([
+                {brightness, -45},
+                {contrast, 30},
+                {saturation, 75},
+                {ae_level, -25},
+                {sharpness, 40}
+            ])
+        ),
+        ?assertEqual(-45, get({esp32cam_control, brightness})),
+        ?assertEqual(30, get({esp32cam_control, contrast})),
+        ?assertEqual(75, get({esp32cam_control, saturation})),
+        ?assertEqual(-25, get({esp32cam_control, ae_level})),
+        ?assertEqual(40, get({esp32cam_control, sharpness})),
+
+        ?assertEqual(
+            ok,
+            esp32cam_mock:reconfigure([
+                {brightness, 0},
+                {contrast, 100},
+                {saturation, -100},
+                {ae_level, 2},
+                {sharpness, -2}
+            ])
+        ),
+        ?assertEqual(0, get({esp32cam_control, brightness})),
+        ?assertEqual(100, get({esp32cam_control, contrast})),
+        ?assertEqual(-100, get({esp32cam_control, saturation})),
+        ?assertEqual(2, get({esp32cam_control, ae_level})),
+        ?assertEqual(-2, get({esp32cam_control, sharpness})),
+
+        % 2. Boundary values at runtime set_control/2 across all 5 level controls
+        lists:foreach(
+            fun(Ctrl) ->
+                ?assertEqual(ok, esp32cam_mock:set_control(Ctrl, -100)),
+                ?assertEqual(-100, get({esp32cam_control, Ctrl})),
+                ?assertEqual(ok, esp32cam_mock:set_control(Ctrl, 0)),
+                ?assertEqual(0, get({esp32cam_control, Ctrl})),
+                ?assertEqual(ok, esp32cam_mock:set_control(Ctrl, 100)),
+                ?assertEqual(100, get({esp32cam_control, Ctrl}))
+            end,
+            [brightness, contrast, saturation, ae_level, sharpness]
+        ),
+
+        % 3. Out-of-range and malformed level values are rejected
+        InvalidLevels = [-101, 101, 1.5, {fine, 50}, high],
+        lists:foreach(
+            fun(BadLevel) ->
+                ?assertEqual({error, badarg}, esp32cam_mock:set_control(brightness, BadLevel)),
+                ?assertEqual({error, badarg}, esp32cam_mock:set_control(ae_level, BadLevel)),
+                ?assertEqual({error, badarg}, esp32cam_mock:set_control(sharpness, BadLevel)),
+                ?assertMatch(
+                    {error, {invalid_brightness, BadLevel}},
+                    esp32cam_mock:init([{brightness, BadLevel}])
+                )
+            end,
+            InvalidLevels
+        ),
+
+        % 4. Sensor-specific sharpness capability (OV2640 lacks fine sharpness; OV5640 supports it)
+        put(esp32cam_mock_sensor_pid, ov2640),
+        ?assertEqual(ok, esp32cam_mock:init([{brightness, 50}, {contrast, -20}])),
+        ?assertEqual({error, unsupported}, esp32cam_mock:set_control(sharpness, 50)),
+        put(esp32cam_mock_sensor_pid, ov5640),
+        ?assertEqual(ok, esp32cam_mock:init()),
+        ?assertEqual(ok, esp32cam_mock:set_control(sharpness, 50)),
+        put(esp32cam_mock_sensor_pid, nt99141),
+        ?assertEqual(ok, esp32cam_mock:init()),
+        ?assertEqual({error, unsupported}, esp32cam_mock:set_control(brightness, 50)),
+
+        erase(esp32cam_mock_sensor_pid),
+        ok = esp32cam_mock:init()
+    end).
+
+test_exposure_gain_image_controls() ->
+    ?_test(begin
+        erase(esp32cam_mock_sensor_pid),
+
+        % 1. Init with exposure, gain, sharpness, and denoise controls
+        ?assertEqual(
+            ok,
+            esp32cam_mock:init([
+                {exposure_ctrl, false},
+                {aec2, true},
+                {aec_value, 600},
+                {gain_ctrl, false},
+                {agc_gain, 32},
+                {gainceiling, '16x'},
+                {denoise, 4}
+            ])
+        ),
+        ?assertEqual(false, get({esp32cam_control, exposure_ctrl})),
+        ?assertEqual(true, get({esp32cam_control, aec2})),
+        ?assertEqual(600, get({esp32cam_control, aec_value})),
+        ?assertEqual(false, get({esp32cam_control, gain_ctrl})),
+        ?assertEqual(32, get({esp32cam_control, agc_gain})),
+        ?assertEqual('16x', get({esp32cam_control, gainceiling})),
+        ?assertEqual(4, get({esp32cam_control, denoise})),
+
+        % 2. Boundary checks at runtime set_control/2
+        ?assertEqual(ok, esp32cam_mock:set_control(exposure_ctrl, true)),
+        ?assertEqual(ok, esp32cam_mock:set_control(aec2, false)),
+        ?assertEqual(ok, esp32cam_mock:set_control(aec_value, 0)),
+        ?assertEqual(ok, esp32cam_mock:set_control(aec_value, 1200)),
+        ?assertEqual(ok, esp32cam_mock:set_control(gain_ctrl, true)),
+        ?assertEqual(ok, esp32cam_mock:set_control(agc_gain, 0)),
+        ?assertEqual(ok, esp32cam_mock:set_control(agc_gain, 64)),
+        ?assertEqual(ok, esp32cam_mock:set_control(denoise, 0)),
+        ?assertEqual(ok, esp32cam_mock:set_control(denoise, 8)),
+        lists:foreach(
+            fun(GC) ->
+                ?assertEqual(ok, esp32cam_mock:set_control(gainceiling, GC)),
+                ?assertEqual(GC, get({esp32cam_control, gainceiling}))
+            end,
+            ['2x', '4x', '8x', '16x', '32x', '64x', '128x', 0, 6]
+        ),
+
+        % 3. Invalid bounds are rejected
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(aec_value, -1)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(aec_value, 1201)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(agc_gain, -1)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(agc_gain, 65)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(gainceiling, '256x')),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(gainceiling, 7)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(denoise, -1)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(denoise, 9)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(exposure_ctrl, on)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(aec2, 1)),
+        ?assertEqual({error, badarg}, esp32cam_mock:set_control(gain_ctrl, auto)),
+        ?assertEqual({error, {invalid_aec_value, 1201}}, esp32cam_mock:init([{aec_value, 1201}])),
+        ?assertEqual({error, {invalid_agc_gain, 65}}, esp32cam_mock:init([{agc_gain, 65}])),
+        ?assertEqual(
+            {error, {invalid_gainceiling, '256x'}}, esp32cam_mock:init([{gainceiling, '256x'}])
+        ),
+        ?assertEqual({error, {invalid_denoise, 9}}, esp32cam_mock:init([{denoise, 9}]))
     end).
 
 %%====================================================================
@@ -620,8 +765,8 @@ test_invalid_driver_options() ->
             [{auto_white_balance, not_a_boolean}],
             [{awb_gain, not_a_boolean}],
             [{wb_mode, invalid_mode}],
-            [{brightness, -3}],
-            [{brightness, 3}],
+            [{brightness, -101}],
+            [{brightness, 101}],
             [{contrast, 1.5}],
             [{saturation, high}],
             [{hmirror, 1}],

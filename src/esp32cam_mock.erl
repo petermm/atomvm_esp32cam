@@ -386,7 +386,7 @@ mock_init(Config) ->
                 _ ->
                     case esp32cam:validate_init_config(Config) of
                         {ok, Board} ->
-                            case check_config_wb_support(Config) of
+                            case check_config_control_support(Config) of
                                 ok ->
                                     put(esp32cam_current_board, Board),
                                     store_custom_flash_pin(Config, Board),
@@ -430,7 +430,7 @@ mock_reconfigure(Config) ->
                                     clear_init_controls(),
                                     {error, mock_reconfigure_failed};
                                 _ ->
-                                    case check_config_wb_support(Config) of
+                                    case check_config_control_support(Config) of
                                         {error, _} = Error ->
                                             erase(esp32cam_current_board),
                                             erase(esp32cam_custom_flash_pin),
@@ -506,31 +506,66 @@ store_init_controls(Config) ->
     ).
 
 supported_controls() ->
-    [wb_mode, auto_white_balance, awb_gain, brightness, contrast, saturation, hmirror, vflip].
+    [
+        wb_mode,
+        auto_white_balance,
+        awb_gain,
+        brightness,
+        contrast,
+        saturation,
+        ae_level,
+        sharpness,
+        exposure_ctrl,
+        aec2,
+        aec_value,
+        gain_ctrl,
+        agc_gain,
+        gainceiling,
+        denoise,
+        hmirror,
+        vflip
+    ].
 
-is_custom_wb_supported() ->
+is_sensor_in(Sensors) ->
     case get(esp32cam_mock_sensor_pid) of
         undefined -> true;
-        ov2640 -> true;
-        ov3660 -> true;
-        ov5640 -> true;
-        gc0308 -> true;
-        16#26 -> true;
-        16#3660 -> true;
-        16#5640 -> true;
-        16#9b -> true;
-        _ -> false
+        Pid -> lists:member(Pid, Sensors)
     end.
 
-check_config_wb_support(Config) ->
-    case proplists:get_value(wb_mode, Config) of
-        {custom, _, _, _} ->
-            case is_custom_wb_supported() of
-                true -> ok;
-                false -> {error, unsupported}
-            end;
-        _ ->
-            ok
+check_control_support(wb_mode, {custom, _, _, _}) ->
+    case is_sensor_in([ov2640, ov3660, ov5640, gc0308, 16#26, 16#3660, 16#5640, 16#9b]) of
+        true -> ok;
+        false -> {error, unsupported}
+    end;
+check_control_support(sharpness, _) ->
+    case is_sensor_in([ov3660, ov5640, gc0308, 16#3660, 16#5640, 16#9b]) of
+        true -> ok;
+        false -> {error, unsupported}
+    end;
+check_control_support(Control, _) when
+    Control =:= brightness; Control =:= contrast; Control =:= saturation; Control =:= ae_level
+->
+    case is_sensor_in([ov2640, ov3660, ov5640, gc0308, 16#26, 16#3660, 16#5640, 16#9b]) of
+        true -> ok;
+        false -> {error, unsupported}
+    end;
+check_control_support(_, _) ->
+    ok.
+
+check_config_control_support(Config) ->
+    check_config_control_support_list(supported_controls(), Config).
+
+check_config_control_support_list([], _Config) ->
+    ok;
+check_config_control_support_list([Control | Rest], Config) ->
+    case proplists:get_value(Control, Config) of
+        undefined ->
+            check_config_control_support_list(Rest, Config);
+        Value ->
+            case check_control_support(Control, Value) of
+                ok -> check_config_control_support_list(Rest, Config);
+                Error -> Error
+            end
     end.
 
 mock_set_control(Control, Value) ->
@@ -543,17 +578,14 @@ mock_set_control(Control, Value) ->
                     case get(?MOCK_BEHAVIOR_KEY) of
                         always_error ->
                             {error, mock_control_failed};
-                        _ when Control =:= wb_mode andalso is_tuple(Value) ->
-                            case is_custom_wb_supported() of
-                                true ->
+                        _ ->
+                            case check_control_support(Control, Value) of
+                                ok ->
                                     put({esp32cam_control, Control}, Value),
                                     ok;
-                                false ->
-                                    {error, unsupported}
-                            end;
-                        _ ->
-                            put({esp32cam_control, Control}, Value),
-                            ok
+                                Error ->
+                                    Error
+                            end
                     end
             end;
         Error ->
@@ -569,11 +601,34 @@ validate_control(auto_white_balance, Value) when is_boolean(Value) ->
     ok;
 validate_control(awb_gain, Value) when is_boolean(Value) ->
     ok;
-validate_control(brightness, Value) when is_integer(Value), Value >= -2, Value =< 2 ->
+validate_control(Control, Value) when
+    Control =:= brightness;
+    Control =:= contrast;
+    Control =:= saturation;
+    Control =:= ae_level;
+    Control =:= sharpness
+->
+    case esp32cam:is_valid_level_control(Value) of
+        true -> ok;
+        false -> {error, badarg}
+    end;
+validate_control(Control, Value) when
+    Control =:= exposure_ctrl; Control =:= aec2; Control =:= gain_ctrl
+->
+    case is_boolean(Value) of
+        true -> ok;
+        false -> {error, badarg}
+    end;
+validate_control(aec_value, Value) when is_integer(Value), Value >= 0, Value =< 1200 ->
     ok;
-validate_control(contrast, Value) when is_integer(Value), Value >= -2, Value =< 2 ->
+validate_control(agc_gain, Value) when is_integer(Value), Value >= 0, Value =< 64 ->
     ok;
-validate_control(saturation, Value) when is_integer(Value), Value >= -2, Value =< 2 ->
+validate_control(gainceiling, Value) ->
+    case esp32cam:is_valid_gainceiling(Value) of
+        true -> ok;
+        false -> {error, badarg}
+    end;
+validate_control(denoise, Value) when is_integer(Value), Value >= 0, Value =< 8 ->
     ok;
 validate_control(hmirror, Value) when is_boolean(Value) ->
     ok;

@@ -14,7 +14,7 @@ This driver runs as a native ESP-IDF component compiled directly into the AtomVM
 * **15 Predefined Boards + Custom Pinouts**: Out-of-the-box support for popular ESP32 and ESP32-S3 boards (including AI-Thinker, WROVER-KIT, ESP32-S3 WROOM/XIAO/GOOUUU, M5Cam, LilyGO T-Camera, and ESP-EYE), arbitrary `{board, custom}` GPIO pinouts, and runtime detection via `camera_scanner`.
 * **Standard & Zero-Copy Frame Capture**: Capture reference-counted Erlang binaries (`capture/0,1`) or lease PSRAM/driver framebuffers directly with zero extra copies (`capture_frame/0,1`, `frame_binary/1`, `frame_info/1`, `release_frame/1`) and non-blocking readiness checks (`available_frames/0`).
 * **Up to 5MP Resolution & 10 Pixel Formats**: Capture from `96x96` up to `'5mp'` (`2592x1944`) across `jpeg`, `rgb565`, `grayscale`, `yuv422`, `yuv420`, `rgb888`, `raw`, `rgb444`, `rgb555`, and `raw8`.
-* **Runtime Reconfiguration & Sensor Controls**: Dynamically resize or switch pixel formats without a full teardown via `reconfigure/1`, adjust live controls (`brightness`, `contrast`, `saturation`, `hmirror`, `vflip`, `wb_mode` presets or custom `{custom, R, G, B}` RGB gains), and toggle PSRAM DMA mode (`set_psram_mode/1`).
+* **Runtime Reconfiguration & Fine-Grained Sensor Controls**: Dynamically resize or switch pixel formats without a full teardown via `reconfigure/1`, adjust smooth `-100..100` image controls (`brightness`, `contrast`, `saturation`, `ae_level`, `sharpness`), manual/auto exposure and gain (`exposure_ctrl`, `aec2`, `aec_value`, `gain_ctrl`, `agc_gain`, `gainceiling`, `denoise`), custom `{custom, R, G, B}` white balance gains, and PSRAM DMA mode (`set_psram_mode/1`).
 * **Flash LED & Warm-Up Calibration**: Built-in board flash control with pre-shot exposure delay (`{flash, on}`, `{flash_delay_ms, Ms}`) and C-level `warm_up_frames` discarding.
 * **OV5640 Autofocus Support**: Opt-in autofocus configuration, triggering, polling, and wait APIs (`af_init/1`, `af_set_mode/1`, `af_trigger/0`, `af_get_status/0`, `af_wait/1`, `af_set_manual_position/1`).
 * **Terminal Preview & Off-Hardware Mocks**: Render captured binaries or leased frames directly in iTerm2-compatible terminals with `term_image:display/1`, and run unit/Common Test suites on your host using `esp32cam_mock`.
@@ -97,8 +97,11 @@ ok = esp32cam:reconfigure([
     {grab_mode, latest}
 ]),
 
-% Tune sensor controls live
-ok = esp32cam:set_control(brightness, 1),
+% Tune sensor controls live (-100..100 for image level controls)
+ok = esp32cam:set_control(brightness, 25),
+ok = esp32cam:set_control(contrast, -10),
+ok = esp32cam:set_control(exposure_ctrl, false),
+ok = esp32cam:set_control(aec_value, 450),
 ok = esp32cam:set_control(wb_mode, sunny),
 
 % Or set normalized 8-bit custom RGB white balance gains (0..255, 64 = ~1.0x)

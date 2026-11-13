@@ -142,25 +142,42 @@ When initializing the camera with `esp32cam:init/1`, you pass a proplist of opti
 
 ### Brightness
 * **Key**: `brightness`
-* **Type**: `-2..2`
+* **Type**: `-100..100`
 * **Default**: `0`
-* **Description**: Controls the image brightness.
+* **Description**: Controls image brightness using smooth register-level steps on OV2640, OV3660, OV5640, and GC0308 sensors (returns `{error, unsupported}` on other sensors).
 
 ---
 
 ### Contrast
 * **Key**: `contrast`
-* **Type**: `-2..2`
+* **Type**: `-100..100`
 * **Default**: `0`
-* **Description**: Controls the image contrast.
+* **Description**: Controls image contrast using smooth register-level steps on OV2640, OV3660, OV5640, and GC0308 sensors (returns `{error, unsupported}` on other sensors).
 
 ---
 
 ### Saturation
 * **Key**: `saturation`
-* **Type**: `-2..2`
+* **Type**: `-100..100`
 * **Default**: `0`
-* **Description**: Controls the image saturation.
+* **Description**: Controls image saturation using smooth register-level steps on OV2640, OV3660, OV5640, and GC0308 sensors (returns `{error, unsupported}` on other sensors).
+
+---
+
+### Exposure & Gain Controls
+* **`ae_level`** (`-100..100`, default `0`): Auto-exposure compensation target. Interpolates AE target registers on OV2640, OV3660, OV5640, and GC0308 sensors.
+* **`exposure_ctrl`** (`boolean()`, default `true`): Enable or disable Automatic Exposure Control (AEC).
+* **`aec2`** (`boolean()`, default `false`): Enable or disable DSP-level secondary AEC processing.
+* **`aec_value`** (`0..1200`): Manual exposure time value when `exposure_ctrl` is `false`.
+* **`gain_ctrl`** (`boolean()`, default `true`): Enable or disable Automatic Gain Control (AGC).
+* **`agc_gain`** (`0..64`): Manual sensor analog/digital gain when `gain_ctrl` is `false` (note: some sensors such as OV2640 and GC0308 clamp the upper range to `30`).
+* **`gainceiling`** (`'2x' | '4x' | '8x' | '16x' | '32x' | '64x' | '128x' | 0..6`, default `'2x'`): Maximum automatic gain ceiling when `gain_ctrl` is `true`.
+
+---
+
+### Sharpness & Denoise
+* **`sharpness`** (`-100..100`, default `0`): Controls edge enhancement/sharpness on supported sensors (OV3660, OV5640, GC0308; returns `{error, unsupported}` on OV2640 and other sensors).
+* **`denoise`** (`0..8`, default `0`): Controls hardware noise reduction level (`0` disables denoise) on supported sensors (e.g., OV3660, OV5640).
 
 ---
 
@@ -207,9 +224,14 @@ ok = esp32cam:set_control(wb_mode, sunny),
 ok = esp32cam:set_control(wb_mode, {custom, 80, 64, 52}),
 ok = esp32cam:set_control(auto_white_balance, true),
 ok = esp32cam:set_control(awb_gain, true),
-ok = esp32cam:set_control(brightness, 1),
-ok = esp32cam:set_control(contrast, -1),
-ok = esp32cam:set_control(saturation, 2),
+ok = esp32cam:set_control(brightness, 25),
+ok = esp32cam:set_control(contrast, -15),
+ok = esp32cam:set_control(saturation, 40),
+ok = esp32cam:set_control(ae_level, 10),
+ok = esp32cam:set_control(exposure_ctrl, false),
+ok = esp32cam:set_control(aec_value, 450),
+ok = esp32cam:set_control(gain_ctrl, false),
+ok = esp32cam:set_control(agc_gain, 12),
 ok = esp32cam:set_control(hmirror, true),
 ok = esp32cam:set_control(vflip, false).
 ```
@@ -219,9 +241,18 @@ Supported controls and values:
 * `wb_mode`: `auto | sunny | cloudy | office | home | {custom, 0..255, 0..255, 0..255}`
 * `auto_white_balance`: `boolean()`
 * `awb_gain`: `boolean()`
-* `brightness`: `-2..2`
-* `contrast`: `-2..2`
-* `saturation`: `-2..2`
+* `brightness`: `-100..100`
+* `contrast`: `-100..100`
+* `saturation`: `-100..100`
+* `ae_level`: `-100..100`
+* `sharpness`: `-100..100`
+* `exposure_ctrl`: `boolean()`
+* `aec2`: `boolean()`
+* `aec_value`: `0..1200`
+* `gain_ctrl`: `boolean()`
+* `agc_gain`: `0..64`
+* `gainceiling`: `'2x' | '4x' | '8x' | '16x' | '32x' | '64x' | '128x' | 0..6`
+* `denoise`: `0..8`
 * `hmirror`: `boolean()`
 * `vflip`: `boolean()`
 
