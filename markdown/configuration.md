@@ -76,9 +76,9 @@ When initializing the camera with `esp32cam:init/1`, you pass a proplist of opti
 
 ### Frame Buffer Count
 * **Key**: `fb_count`
-* **Type**: `pos_integer()`
-* **Default**: `1`
-* **Description**: Number of frame buffers allocated for the camera sensor. Setting this to `2` or more enables double-buffering, which improves frame rate and capture performance under heavy application load at the cost of using double the memory.
+* **Type**: `pos_integer() | auto`
+* **Default**: `auto`
+* **Description**: Number of frame buffers allocated for the camera sensor. Setting `auto` selects `1`, `2`, or `3` buffers automatically based on available PSRAM (`psram_size/0`), `fb_location`, `frame_size`, and `pixel_format` (keeping total buffers within 25% of PSRAM, or `1` when using DRAM or when PSRAM is unavailable). Setting an integer `2` or higher explicitly configures multi-buffering.
 
 ---
 
@@ -225,7 +225,7 @@ The following options are advanced settings intended for troubleshooting or cust
 
 ## Capture-Time Flash Options
 
-When calling `esp32cam:capture/1` or `esp32cam:capture_with_flash/2`, you can pass options to control flash photography:
+When calling `esp32cam:capture/1`, `esp32cam:capture_frame/1`, or `esp32cam:capture_with_flash/2`, you can pass options to control flash photography:
 
 * **`{flash, on | off}`**: Enforce turning on or off the board's high-power LED flash during capture. Defaults to `off`.
 * **`{flash_delay_ms, non_neg_integer()}`**: Specifies a pre-shot delay in milliseconds after turning on the flash LED before capturing the frame. This is crucial for allowing the sensor to auto-adjust exposure and focus under the bright light. Defaults to `0` (immediate capture).

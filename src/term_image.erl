@@ -18,19 +18,27 @@
 %%
 %% Usage:
 %%   term_image:display(ImageBinary)
+%%   term_image:display(Frame)
 
 -module(term_image).
 
--export([display/1]).
+-export([display/1, display_frame_nif/1]).
 
 %% ============================================================
 %% Public API
 %% ============================================================
 
 %% Display with default options.
--spec display(binary()) -> ok | {error, badarg | too_large}.
-display(Image) ->
-    display_image(Image).
+-spec display(binary() | esp32cam:frame()) ->
+    ok | {error, badarg | too_large | already_released | io_error}.
+display(Image) when is_binary(Image) ->
+    display_image(Image);
+display(Frame) ->
+    % Keep this remote so AtomVM's NIF resolver can intercept the call.
+    term_image:display_frame_nif(Frame).
+
+display_frame_nif(_Frame) ->
+    {error, badarg}.
 
 display_image(Image) when is_binary(Image), byte_size(Image) =< 262144 ->
     B64 = base64:encode(Image),

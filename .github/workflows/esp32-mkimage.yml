@@ -36,7 +36,7 @@ jobs:
         compiler_pkgs: ["clang-19"]
         soc: ["esp32", "esp32s3"]
         flavor: ["", "-elixir"]
-        atomvm_versions: ["main"]
+        atomvm_versions: ["release-0.7"]
 
     env:
       CC: ${{ matrix.cc }}
@@ -110,9 +110,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.flavor }}" = "-elixir" ]; then
-            cmake -G Ninja -DAVM_RELEASE=ON ..
+            cmake -G Ninja -DAVM_RELEASE=ON -DAVM_BUILD_RUNTIME_ONLY=ON ..
           else
-            cmake -G Ninja ..
+            cmake -G Ninja -DAVM_BUILD_RUNTIME_ONLY=ON ..
           fi
           # git clone will use more recent timestamps than cached beam files
           # touch them so we can benefit from the cache and avoid costly beam file rebuild.
@@ -121,7 +121,11 @@ jobs:
       - name: "Build erlang and Elixir libs"
         working-directory: ./AtomVM/build
         run: |
-          LANG=en_US.UTF-8 ninja
+          if [ "${{ matrix.flavor }}" = "-elixir" ]; then
+            LANG=en_US.UTF-8 ninja elixir_esp32boot
+          else
+            LANG=en_US.UTF-8 ninja esp32boot
+          fi
 
       - name: "Build the esp32cam firmware"
         run: |
