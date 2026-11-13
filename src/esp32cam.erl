@@ -19,6 +19,8 @@
 -export([
     init/0, init/1,
     init_nif/1,
+    reconfigure/1,
+    reconfigure_nif/1,
     set_control/2,
     set_control_nif/2,
     capture/0, capture/1,
@@ -464,6 +466,54 @@ init(Config) ->
 
 %% NIF function for camera initialization
 init_nif(_Config) ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
+%% @param   Config  the ESP32cam configuration
+%% @returns `ok' or error with reason
+%% @doc     Reconfigure an already-initialized camera at runtime using
+%%          `esp_camera_reconfigure'. Preserves the active board configuration
+%%          when `{board, ...}' is omitted. Fails with `{error, bad_state}' if
+%%          the camera is not initialized or `{error, frames_in_use}' if any
+%%          frame leases are active. Invalidates autofocus initialization.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec reconfigure(Config :: esp32cam_config()) -> ok | {error, Reason :: term()}.
+reconfigure(Config) ->
+    case validate_init_config(Config) of
+        {ok, _} ->
+            ResolvedFbCount = resolve_fb_count(proplists:get_value(fb_count, Config, auto), Config),
+            ResolvedConfig = [{fb_count, ResolvedFbCount} | proplists:delete(fb_count, Config)],
+            case esp32cam:reconfigure_nif(ResolvedConfig) of
+                ok ->
+                    case proplists:is_defined(board, Config) of
+                        true ->
+                            store_board_type(Config);
+                        false ->
+                            case get(?BOARD_KEY) of
+                                custom ->
+                                    case proplists:is_defined(pin_flash, Config) of
+                                        true -> store_custom_flash_pin(Config);
+                                        false -> ok
+                                    end;
+                                _ ->
+                                    ok
+                            end
+                    end,
+                    ok;
+                {error, Reason} = Error when Reason =:= frames_in_use; Reason =:= bad_state ->
+                    Error;
+                Error ->
+                    erase(?BOARD_KEY),
+                    erase(?CUSTOM_FLASH_PIN_KEY),
+                    Error
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% NIF function for runtime camera reconfiguration
+reconfigure_nif(_Config) ->
     throw(nif_error).
 
 %%-----------------------------------------------------------------------------

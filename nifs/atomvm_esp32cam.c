@@ -695,6 +695,7 @@ static const char *const io_error_a = "\x8"
 uint8_t camera_initialized = 0;
 uint8_t camera_af_initialized = 0;
 board_type_t initialized_board_type = BOARD_INVALID;
+static board_config_t initialized_board_config;
 int initialized_flash_pin = -1;
 int initialized_xclk_pin = -1;
 
@@ -1133,22 +1134,25 @@ static bool parse_af_config(Context *ctx, term config, esp_camera_af_config_t *o
 }
 #endif
 
-static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
+static term nif_esp32cam_apply_config_locked(Context *ctx, int argc, term argv[], bool is_reconfigure)
 {
-    // Check if camera is already initialized
-    if (camera_initialized) {
+    if (is_reconfigure) {
+        if (argc != 1) {
+            RAISE_ERROR(BADARG_ATOM);
+        }
+        if (!camera_initialized) {
+            ESP_LOGE(TAG, "Camera not initialized! Call esp32cam:init() first.");
+            if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+                RAISE_ERROR(MEMORY_ATOM);
+            }
+            return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, bad_state_a));
+        }
         if (outstanding_leases > 0) {
             if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
                 RAISE_ERROR(MEMORY_ATOM);
             }
             return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, frames_in_use_a));
         }
-        ESP_LOGW(TAG, "Camera already initialized, deinitializing first");
-        deinit_camera_and_reset_xclk(initialized_xclk_pin);
-        camera_initialized = 0;
-        initialized_board_type = BOARD_INVALID;
-        initialized_flash_pin = -1;
-        initialized_xclk_pin = -1;
     }
 
     term config;
@@ -1159,8 +1163,14 @@ static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
         config = argv[0];
     }
 
-    // Parse board type
-    board_type_t board_type = get_board_type(ctx, interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, board_a)));
+    // Parse board type (reconfigure preserves active board when omitted)
+    term board_term = interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, board_a));
+    board_type_t board_type;
+    if (is_reconfigure && term_is_nil(board_term)) {
+        board_type = initialized_board_type;
+    } else {
+        board_type = get_board_type(ctx, board_term);
+    }
     if (board_type == BOARD_INVALID) {
         ESP_LOGE(TAG, "Invalid board type");
         RAISE_ERROR(BADARG_ATOM);
@@ -1171,24 +1181,43 @@ static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
     const board_config_t *selected_board_config = NULL;
 
     if (board_type == BOARD_CUSTOM) {
+        bool inherit_custom_pins = (is_reconfigure && term_is_nil(board_term) && initialized_board_type == BOARD_CUSTOM);
+        int def_pwdn = inherit_custom_pins ? initialized_board_config.pin_pwdn : -1;
+        int def_reset = inherit_custom_pins ? initialized_board_config.pin_reset : -1;
+        int def_xclk = inherit_custom_pins ? initialized_board_config.pin_xclk : INVALID_PIN_VALUE;
+        int def_sda = inherit_custom_pins ? initialized_board_config.pin_sccb_sda : INVALID_PIN_VALUE;
+        int def_scl = inherit_custom_pins ? initialized_board_config.pin_sccb_scl : INVALID_PIN_VALUE;
+        int def_d7 = inherit_custom_pins ? initialized_board_config.pin_d7 : INVALID_PIN_VALUE;
+        int def_d6 = inherit_custom_pins ? initialized_board_config.pin_d6 : INVALID_PIN_VALUE;
+        int def_d5 = inherit_custom_pins ? initialized_board_config.pin_d5 : INVALID_PIN_VALUE;
+        int def_d4 = inherit_custom_pins ? initialized_board_config.pin_d4 : INVALID_PIN_VALUE;
+        int def_d3 = inherit_custom_pins ? initialized_board_config.pin_d3 : INVALID_PIN_VALUE;
+        int def_d2 = inherit_custom_pins ? initialized_board_config.pin_d2 : INVALID_PIN_VALUE;
+        int def_d1 = inherit_custom_pins ? initialized_board_config.pin_d1 : INVALID_PIN_VALUE;
+        int def_d0 = inherit_custom_pins ? initialized_board_config.pin_d0 : INVALID_PIN_VALUE;
+        int def_vsync = inherit_custom_pins ? initialized_board_config.pin_vsync : INVALID_PIN_VALUE;
+        int def_href = inherit_custom_pins ? initialized_board_config.pin_href : INVALID_PIN_VALUE;
+        int def_pclk = inherit_custom_pins ? initialized_board_config.pin_pclk : INVALID_PIN_VALUE;
+        int def_flash = inherit_custom_pins ? initialized_board_config.pin_flash : -1;
+
         // Parse custom pins
-        custom_board_config.pin_pwdn = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_pwdn_a)), -1);
-        custom_board_config.pin_reset = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_reset_a)), -1);
-        custom_board_config.pin_xclk = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_xclk_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_sccb_sda = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_sccb_sda_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_sccb_scl = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_sccb_scl_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_d7 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d7_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_d6 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d6_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_d5 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d5_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_d4 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d4_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_d3 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d3_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_d2 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d2_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_d1 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d1_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_d0 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d0_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_vsync = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_vsync_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_href = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_href_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_pclk = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_pclk_a)), INVALID_PIN_VALUE);
-        custom_board_config.pin_flash = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_flash_a)), -1);
+        custom_board_config.pin_pwdn = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_pwdn_a)), def_pwdn);
+        custom_board_config.pin_reset = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_reset_a)), def_reset);
+        custom_board_config.pin_xclk = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_xclk_a)), def_xclk);
+        custom_board_config.pin_sccb_sda = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_sccb_sda_a)), def_sda);
+        custom_board_config.pin_sccb_scl = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_sccb_scl_a)), def_scl);
+        custom_board_config.pin_d7 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d7_a)), def_d7);
+        custom_board_config.pin_d6 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d6_a)), def_d6);
+        custom_board_config.pin_d5 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d5_a)), def_d5);
+        custom_board_config.pin_d4 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d4_a)), def_d4);
+        custom_board_config.pin_d3 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d3_a)), def_d3);
+        custom_board_config.pin_d2 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d2_a)), def_d2);
+        custom_board_config.pin_d1 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d1_a)), def_d1);
+        custom_board_config.pin_d0 = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_d0_a)), def_d0);
+        custom_board_config.pin_vsync = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_vsync_a)), def_vsync);
+        custom_board_config.pin_href = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_href_a)), def_href);
+        custom_board_config.pin_pclk = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_pclk_a)), def_pclk);
+        custom_board_config.pin_flash = get_pin_value(interop_proplist_get_value(config, globalcontext_make_atom(ctx->global, pin_flash_a)), def_flash);
         custom_board_config.name = "CUSTOM";
 
         // Validate custom pin assignments
@@ -1436,20 +1465,46 @@ static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
         RAISE_ERROR(MEMORY_ATOM);
     }
 
-    ESP_LOGI(TAG, "Attempting to initialize camera with config: board=%s, frame_size=%d, jpeg_quality=%d",
-        selected_board_config->name, frame_size, jpeg_quality);
-
-    esp_err_t err = esp_camera_init(camera_config);
+    esp_err_t err;
+    if (!is_reconfigure) {
+        if (camera_initialized) {
+            if (outstanding_leases > 0) {
+                free(camera_config);
+                if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+                    RAISE_ERROR(MEMORY_ATOM);
+                }
+                return port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, frames_in_use_a));
+            }
+            ESP_LOGW(TAG, "Camera already initialized, deinitializing first");
+            deinit_camera_and_reset_xclk(initialized_xclk_pin);
+            camera_initialized = 0;
+            initialized_board_type = BOARD_INVALID;
+            initialized_flash_pin = -1;
+            initialized_xclk_pin = -1;
+        }
+        ESP_LOGI(TAG, "Attempting to initialize camera with config: board=%s, frame_size=%d, jpeg_quality=%d",
+            selected_board_config->name, frame_size, jpeg_quality);
+        err = esp_camera_init(camera_config);
+    } else {
+        ESP_LOGI(TAG, "Attempting to reconfigure camera with config: board=%s, frame_size=%d, jpeg_quality=%d",
+            selected_board_config->name, frame_size, jpeg_quality);
+        camera_af_initialized = 0;
+        err = esp_camera_reconfigure(camera_config);
+    }
     free(camera_config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize esp_camera: err=0x%x (%s)", err, esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to %s esp_camera: err=0x%x (%s)",
+            is_reconfigure ? "reconfigure" : "initialize", err, esp_err_to_name(err));
         ESP_LOGE(TAG, "Common causes: 1) Hardware not connected properly, 2) Pin conflicts, 3) PSRAM issues, 4) Power supply insufficient");
         deinit_camera_and_reset_xclk(selected_board_config->pin_xclk);
+        camera_initialized = 0;
+        initialized_board_type = BOARD_INVALID;
+        initialized_flash_pin = -1;
+        initialized_xclk_pin = -1;
         if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
             RAISE_ERROR(MEMORY_ATOM);
         }
-        term error = port_create_error_tuple(ctx, term_from_int28(err));
-        return error;
+        return port_create_error_tuple(ctx, term_from_int28(err));
     }
 
     sensor_t *s = esp_camera_sensor_get();
@@ -1498,6 +1553,10 @@ static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
         if (sensor_err != 0) {
             ESP_LOGE(TAG, "Failed to apply camera settings: err=%d", sensor_err);
             deinit_camera_and_reset_xclk(selected_board_config->pin_xclk);
+            camera_initialized = 0;
+            initialized_board_type = BOARD_INVALID;
+            initialized_flash_pin = -1;
+            initialized_xclk_pin = -1;
             if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
                 RAISE_ERROR(MEMORY_ATOM);
             }
@@ -1508,6 +1567,10 @@ static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
         || hmirror != INVALID_CONFIG_VALUE || vflip != INVALID_CONFIG_VALUE) {
         ESP_LOGW(TAG, "Could not get sensor pointer to apply camera settings");
         deinit_camera_and_reset_xclk(selected_board_config->pin_xclk);
+        camera_initialized = 0;
+        initialized_board_type = BOARD_INVALID;
+        initialized_flash_pin = -1;
+        initialized_xclk_pin = -1;
         if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
             RAISE_ERROR(MEMORY_ATOM);
         }
@@ -1521,6 +1584,10 @@ static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
             if (!fb) {
                 ESP_LOGE(TAG, "Camera capture failed during warm-up at frame %d", (int) (i + 1));
                 deinit_camera_and_reset_xclk(selected_board_config->pin_xclk);
+                camera_initialized = 0;
+                initialized_board_type = BOARD_INVALID;
+                initialized_flash_pin = -1;
+                initialized_xclk_pin = -1;
                 if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
                     RAISE_ERROR(MEMORY_ATOM);
                 }
@@ -1534,9 +1601,15 @@ static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
     outstanding_leases = 0;
     camera_initialized = 1;
     initialized_board_type = board_type;
+    initialized_board_config = *selected_board_config;
     initialized_flash_pin = selected_board_config->pin_flash;
     initialized_xclk_pin = selected_board_config->pin_xclk;
     return OK_ATOM;
+}
+
+static term nif_esp32cam_init_locked(Context *ctx, int argc, term argv[])
+{
+    return nif_esp32cam_apply_config_locked(ctx, argc, argv, false);
 }
 
 static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
@@ -1547,6 +1620,23 @@ static term nif_esp32cam_init(Context *ctx, int argc, term argv[])
 
     LOCK();
     term result = nif_esp32cam_init_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
+static term nif_esp32cam_reconfigure_locked(Context *ctx, int argc, term argv[])
+{
+    return nif_esp32cam_apply_config_locked(ctx, argc, argv, true);
+}
+
+static term nif_esp32cam_reconfigure(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_reconfigure_locked(ctx, argc, argv);
     UNLOCK();
     return result;
 }
@@ -2580,6 +2670,10 @@ static const struct Nif esp32cam_init_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_esp32cam_init
 };
+static const struct Nif esp32cam_reconfigure_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_esp32cam_reconfigure
+};
 static const struct Nif esp32cam_capture_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_esp32cam_capture
@@ -2687,6 +2781,10 @@ const struct Nif *atomvm_esp32cam_get_nif(const char *nifname)
     if (strcmp("esp32cam:init_nif/1", nifname) == 0) {
         TRACE("Resolved platform nif %s ...\n", nifname);
         return &esp32cam_init_nif;
+    }
+    if (strcmp("esp32cam:reconfigure_nif/1", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_reconfigure_nif;
     }
     if (strcmp("esp32cam:capture_nif/1", nifname) == 0) {
         TRACE("Resolved platform nif %s ...\n", nifname);

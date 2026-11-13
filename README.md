@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/atomvm/atomvm_esp32cam/actions/workflows/ci.yml/badge.svg)](https://github.com/atomvm/atomvm_esp32cam/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/esp32cam.svg)](https://hex.pm/packages/esp32cam)
 
-An [AtomVM](https://atomvm.net) NIF driver and Erlang library for controlling ESP32 and ESP32-S3 camera modules (supporting OV2640, OV3660, OV5640, and compatible image sensors). It brings native camera capture, zero-copy streaming, and autofocus control to the Erlang/Elixir BEAM ecosystem.
+An [AtomVM](https://atomvm.net) NIF driver and Erlang library for controlling ESP32 and ESP32-S3 camera modules (supporting OV2640, OV3660, OV5640, and compatible sensors). It brings native camera capture, zero-copy streaming, runtime reconfiguration, and autofocus control to the Erlang/Elixir BEAM ecosystem.
 
 This driver runs as a native ESP-IDF component compiled directly into the AtomVM firmware. Pre-built firmware binaries for popular ESP32 and ESP32-S3 camera boards can be flashed straight from your browser using the [Web Installer](markdown/installer.md).
 
@@ -14,7 +14,7 @@ This driver runs as a native ESP-IDF component compiled directly into the AtomVM
 * **15 Predefined Boards + Custom Pinouts**: Out-of-the-box support for popular ESP32 and ESP32-S3 boards (including AI-Thinker, WROVER-KIT, ESP32-S3 WROOM/XIAO/GOOUUU, M5Cam, LilyGO T-Camera, and ESP-EYE), arbitrary `{board, custom}` GPIO pinouts, and runtime detection via `camera_scanner`.
 * **Standard & Zero-Copy Frame Capture**: Capture reference-counted Erlang binaries (`capture/0,1`) or lease PSRAM/driver framebuffers directly with zero extra copies (`capture_frame/0,1`, `frame_binary/1`, `frame_info/1`, `release_frame/1`) and non-blocking readiness checks (`available_frames/0`).
 * **Up to 5MP Resolution & 10 Pixel Formats**: Capture from `96x96` up to `'5mp'` (`2592x1944`) across `jpeg`, `rgb565`, `grayscale`, `yuv422`, `yuv420`, `rgb888`, `raw`, `rgb444`, `rgb555`, and `raw8`.
-* **Runtime Sensor Controls & PSRAM DMA**: Adjust live controls (`brightness`, `contrast`, `saturation`, `hmirror`, `vflip`, `wb_mode`, `auto_white_balance`, `awb_gain`) without restarting the camera, and toggle PSRAM DMA mode (`set_psram_mode/1`).
+* **Runtime Reconfiguration & Sensor Controls**: Dynamically resize or switch pixel formats without a full teardown via `reconfigure/1`, adjust live controls (`brightness`, `contrast`, `saturation`, `hmirror`, `vflip`, `wb_mode`, `auto_white_balance`, `awb_gain`), and toggle PSRAM DMA mode (`set_psram_mode/1`).
 * **Flash LED & Warm-Up Calibration**: Built-in board flash control with pre-shot exposure delay (`{flash, on}`, `{flash_delay_ms, Ms}`) and C-level `warm_up_frames` discarding.
 * **OV5640 Autofocus Support**: Opt-in autofocus configuration, triggering, polling, and wait APIs (`af_init/1`, `af_set_mode/1`, `af_trigger/0`, `af_get_status/0`, `af_wait/1`, `af_set_manual_position/1`).
 * **Terminal Preview & Off-Hardware Mocks**: Render captured binaries or leased frames directly in iTerm2-compatible terminals with `term_image:display/1`, and run unit/Common Test suites on your host using `esp32cam_mock`.
@@ -86,10 +86,17 @@ end.
 
 > **Note**: While any zero-copy view from `frame_binary/1` is still referenced by live Erlang terms, `release_frame/1` prevents premature buffer return; let references go out of scope (or trigger GC) before releasing.
 
-### 4. Runtime Sensor Controls & PSRAM DMA
-Adjust sensor image controls or toggle PSRAM DMA mode on the fly without calling `init/1` from scratch:
+### 4. Runtime Reconfiguration & Sensor Controls
+Adjust sensor image controls, switch PSRAM DMA mode, or reconfigure resolution/pixel format on the fly without calling `init/1` from scratch:
 
 ```erlang
+% Change resolution and grab mode (all zero-copy frames must be released first)
+ok = esp32cam:reconfigure([
+    {frame_size, vga},
+    {pixel_format, jpeg},
+    {grab_mode, latest}
+]),
+
 % Tune sensor controls live
 ok = esp32cam:set_control(brightness, 1),
 ok = esp32cam:set_control(wb_mode, sunny),
@@ -121,7 +128,7 @@ ok = esp32cam:af_trigger(),
 ```
 
 With AF enabled, operations before successful `af_init/1` return `{error, bad_state}`.
-Reinitializing the camera or setting PSRAM DMA mode (even to the current value)
+Initializing, reconfiguring the camera (`reconfigure/1`), or setting PSRAM DMA mode (even to the current value)
 requires another `af_init/1`. A failed driver-level AF initialization also invalidates AF readiness.
 
 Timeouts are unsigned 32-bit milliseconds. `af_wait(0)` uses the configured timeout;
@@ -137,7 +144,7 @@ callback is unimplemented: `af_set_manual_position/1` returns `{error, -1}` (`ES
 
 | Category | Functions |
 |---|---|
-| **Lifecycle & Info** | `esp32cam:init/0,1`, `esp32cam:get_board_info/0`, `esp32cam:has_flash/0,1`, `esp32cam:psram_size/0` |
+| **Lifecycle & Info** | `esp32cam:init/0,1`, `esp32cam:reconfigure/1`, `esp32cam:get_board_info/0`, `esp32cam:has_flash/0,1`, `esp32cam:psram_size/0` |
 | **Standard Capture** | `esp32cam:capture/0,1`, `esp32cam:capture_with_flash/1,2` |
 | **Zero-Copy Capture** | `esp32cam:capture_frame/0,1`, `esp32cam:frame_binary/1`, `esp32cam:frame_info/1`, `esp32cam:release_frame/1`, `esp32cam:available_frames/0` |
 | **Controls & DMA** | `esp32cam:set_control/2`, `esp32cam:set_psram_mode/1`, `esp32cam:get_psram_mode/0` |
@@ -162,7 +169,7 @@ rebar3 ct
 
 ### Guides
 * 🔌 **[Supported Boards](markdown/board_support.md)**: Pinouts, SoC specs, custom GPIO configuration, and flash GPIO mappings.
-* ⚙️ **[Configuration Reference](markdown/configuration.md)**: Initialization options, `set_control/2` controls, resolutions, and capture parameters.
+* ⚙️ **[Configuration Reference](markdown/configuration.md)**: Initialization options, `reconfigure/1`, `set_control/2` controls, resolutions, and capture parameters.
 * 💡 **[Examples & Recipes](markdown/examples.md)**: Copy-pasteable Erlang snippets for streaming, board auto-detection, flash shots, and low-power setups.
 * ⚡ **[Web Installer](markdown/installer.md)**: Flash official AtomVM + camera firmware directly from your browser.
 * 🛠️ **[Troubleshooting Guide](markdown/troubleshooting.md)**: Diagnostics for initialization errors, memory allocation, signal quality, and flashing.

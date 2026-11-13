@@ -26,7 +26,8 @@ esp32cam_test_() ->
                 fun test_init_invalid_board/0,
                 fun test_init_with_full_driver_config/0,
                 fun test_init_with_white_balance_and_warm_up/0,
-                fun test_reinit_clears_controls/0
+                fun test_reinit_clears_controls/0,
+                test_reconfigure()
             ]},
             {"Capture Tests", [
                 fun test_capture_basic/0,
@@ -195,6 +196,71 @@ test_reinit_clears_controls() ->
         ?assertEqual(undefined, get({esp32cam_control, contrast})),
         ?assertEqual(undefined, get({esp32cam_control, saturation})),
         ?assertEqual(undefined, get({esp32cam_control, hmirror}))
+    end).
+
+test_reconfigure() ->
+    ?_test(begin
+        % 1. Fails before init with {error, bad_state}
+        erase(esp32cam_current_board),
+        ?assertEqual({error, bad_state}, esp32cam_mock:reconfigure([{frame_size, qvga}])),
+
+        % 2. Init with specific board and controls, plus AF
+        ok = esp32cam_mock:init([
+            {board, wrover_kit},
+            {brightness, 1},
+            {fb_count, 1}
+        ]),
+        put(esp32cam_mock_af_supported, true),
+        ok = esp32cam_mock:af_init([]),
+
+        % 3. Invalid config does not alter current state or invalidate AF
+        ?assertMatch(
+            {error, {invalid_frame_size, huge}},
+            esp32cam_mock:reconfigure([{frame_size, huge}])
+        ),
+        ?assertEqual(wrover_kit, get(esp32cam_current_board)),
+        ?assertEqual(1, get({esp32cam_control, brightness})),
+        ?assertEqual(ok, esp32cam_mock:af_trigger()),
+
+        % 4. Active frame lease prevents reconfigure with {error, frames_in_use}
+        {ok, Frame} = esp32cam_mock:capture_frame(),
+        ?assertEqual(
+            {error, frames_in_use},
+            esp32cam_mock:reconfigure([{frame_size, qvga}, {pixel_format, rgb565}])
+        ),
+        ?assertEqual(ok, esp32cam_mock:af_trigger()),
+        ok = esp32cam_mock:release_frame(Frame),
+
+        % 5. Valid reconfigure preserves board when omitted, updates fb_count, resets controls & AF
+        ?assertEqual(
+            ok,
+            esp32cam_mock:reconfigure([
+                {frame_size, uxga},
+                {pixel_format, rgb565},
+                {fb_count, 2},
+                {contrast, -1}
+            ])
+        ),
+        ?assertEqual(wrover_kit, get(esp32cam_current_board)),
+        ?assertEqual(2, get(esp32cam_mock_fb_count)),
+        ?assertEqual(undefined, get({esp32cam_control, brightness})),
+        ?assertEqual(-1, get({esp32cam_control, contrast})),
+        ?assertEqual({error, bad_state}, esp32cam_mock:af_get_status()),
+        ?assertEqual(ok, esp32cam_mock:af_init([])),
+
+        % 6. Custom board flash pin is preserved when board is omitted
+        ok = esp32cam_mock:init(custom_board_config()),
+        ?assertEqual(25, get(esp32cam_custom_flash_pin)),
+        ?assertEqual(ok, esp32cam_mock:reconfigure([{frame_size, qvga}])),
+        ?assertEqual(custom, get(esp32cam_current_board)),
+        ?assertEqual(25, get(esp32cam_custom_flash_pin)),
+
+        % 7. Explicit always_error clears board state (matching driver deinit)
+        esp32cam_mock:set_mock_behavior(always_error),
+        ?assertMatch({error, _}, esp32cam_mock:reconfigure([{frame_size, vga}])),
+        ?assertEqual(undefined, get(esp32cam_current_board)),
+        esp32cam_mock:set_mock_behavior(default),
+        ok = esp32cam_mock:init()
     end).
 
 %%====================================================================

@@ -179,6 +179,24 @@ When initializing the camera with `esp32cam:init/1`, you pass a proplist of opti
 
 ---
 
+## Runtime Reconfiguration (`reconfigure/1`)
+
+Instead of performing a full sensor teardown and reinitialization, an already-initialized camera can be reconfigured at runtime:
+
+```erlang
+ok = esp32cam:reconfigure([
+    {frame_size, svga},
+    {pixel_format, jpeg},
+    {jpeg_quality, 10},
+    {fb_count, auto},
+    {grab_mode, latest}
+]).
+```
+
+Unspecified options inherit their active values (including the active board and custom pin mapping when `board` is omitted). All active zero-copy frames from `capture_frame/0,1` must be released before calling `reconfigure/1` (otherwise it returns `{error, frames_in_use}`). Reconfiguring invalidates autofocus readiness, so call `af_init/1` again if autofocus is in use.
+
+---
+
 ## Runtime Camera Controls
 
 Camera settings can be changed after initialization without restarting the camera:

@@ -4,6 +4,7 @@
 -export([
     init/0,
     init/1,
+    reconfigure/1,
     set_control/2,
     capture/0,
     capture/1,
@@ -109,6 +110,22 @@ init(Config) ->
             catch
                 throw:nif_error -> mock_init(Config);
                 _:_ -> mock_init(Config)
+            end
+    end.
+
+reconfigure(Config) ->
+    case is_mock_mode() of
+        true ->
+            mock_reconfigure(Config);
+        false ->
+            try
+                case esp32cam:reconfigure(Config) of
+                    {error, gpio_init_failed} -> mock_reconfigure(Config);
+                    Result -> Result
+                end
+            catch
+                throw:nif_error -> mock_reconfigure(Config);
+                _:_ -> mock_reconfigure(Config)
             end
     end.
 
@@ -384,7 +401,63 @@ mock_init(Config) ->
             end
     end.
 
-clear_init_controls() ->
+mock_reconfigure(Config) ->
+    case get(esp32cam_current_board) of
+        undefined ->
+            {error, bad_state};
+        CurrentBoard ->
+            HasLeases =
+                case get(esp32cam_mock_outstanding_leases) of
+                    Leases when is_integer(Leases), Leases > 0 -> true;
+                    _ -> false
+                end,
+            case HasLeases of
+                true ->
+                    {error, frames_in_use};
+                false ->
+                    case esp32cam:validate_init_config(Config) of
+                        {ok, ValidatedBoard} ->
+                            case get(?MOCK_BEHAVIOR_KEY) of
+                                always_error ->
+                                    erase(esp32cam_current_board),
+                                    erase(esp32cam_custom_flash_pin),
+                                    clear_init_controls(),
+                                    {error, mock_reconfigure_failed};
+                                _ ->
+                                    NewBoard =
+                                        case proplists:is_defined(board, Config) of
+                                            true -> ValidatedBoard;
+                                            false -> CurrentBoard
+                                        end,
+                                    put(esp32cam_current_board, NewBoard),
+                                    case proplists:is_defined(board, Config) of
+                                        true ->
+                                            store_custom_flash_pin(Config, NewBoard);
+                                        false when NewBoard =:= custom ->
+                                            case proplists:is_defined(pin_flash, Config) of
+                                                true -> store_custom_flash_pin(Config, custom);
+                                                false -> ok
+                                            end;
+                                        false ->
+                                            erase(esp32cam_custom_flash_pin)
+                                    end,
+                                    clear_reconfigure_state(),
+                                    store_init_controls(Config),
+                                    ResolvedFbCount = esp32cam:resolve_fb_count(
+                                        proplists:get_value(fb_count, Config, auto),
+                                        Config
+                                    ),
+                                    put(esp32cam_mock_fb_count, ResolvedFbCount),
+                                    put(esp32cam_mock_outstanding_leases, 0),
+                                    ok
+                            end;
+                        Error ->
+                            Error
+                    end
+            end
+    end.
+
+clear_reconfigure_state() ->
     lists:foreach(
         fun(Control) -> erase({esp32cam_control, Control}) end,
         supported_controls()
@@ -398,9 +471,12 @@ clear_init_controls() ->
     erase(esp32cam_mock_af_focused),
     erase(esp32cam_mock_af_busy),
     erase(esp32cam_mock_af_manual_position),
-    erase(esp32cam_mock_af_supported),
-    erase(esp32cam_mock_af_manual_supported),
     erase(esp32cam_mock_available_frames).
+
+clear_init_controls() ->
+    clear_reconfigure_state(),
+    erase(esp32cam_mock_af_supported),
+    erase(esp32cam_mock_af_manual_supported).
 
 store_init_controls(Config) ->
     lists:foreach(
