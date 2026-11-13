@@ -17,6 +17,7 @@
     psram_size/0,
     set_psram_mode/1,
     get_psram_mode/0,
+    available_frames/0,
     collect_binary_view/1,
     collect_frame/1,
     start_mock_mode/0,
@@ -303,6 +304,19 @@ get_psram_mode() ->
             end
     end.
 
+available_frames() ->
+    case is_mock_mode() of
+        true ->
+            mock_available_frames();
+        false ->
+            try
+                esp32cam:available_frames()
+            catch
+                throw:nif_error -> mock_available_frames();
+                _:_ -> mock_available_frames()
+            end
+    end.
+
 collect_binary_view(View) ->
     case is_mock_mode() of
         true ->
@@ -385,7 +399,8 @@ clear_init_controls() ->
     erase(esp32cam_mock_af_busy),
     erase(esp32cam_mock_af_manual_position),
     erase(esp32cam_mock_af_supported),
-    erase(esp32cam_mock_af_manual_supported).
+    erase(esp32cam_mock_af_manual_supported),
+    erase(esp32cam_mock_available_frames).
 
 store_init_controls(Config) ->
     lists:foreach(
@@ -764,6 +779,34 @@ mock_get_psram_mode() ->
             case get(esp32cam_mock_psram_dma_mode) of
                 undefined -> false;
                 Mode -> Mode
+            end
+    end.
+
+mock_available_frames() ->
+    case get(esp32cam_current_board) of
+        undefined ->
+            false;
+        _ ->
+            case get(esp32cam_mock_available_frames) of
+                Available when is_boolean(Available) ->
+                    Available;
+                _ ->
+                    case get(?MOCK_BEHAVIOR_KEY) of
+                        always_error ->
+                            false;
+                        _ ->
+                            FbCount =
+                                case get(esp32cam_mock_fb_count) of
+                                    undefined -> 1;
+                                    Val -> Val
+                                end,
+                            Leases =
+                                case get(esp32cam_mock_outstanding_leases) of
+                                    undefined -> 0;
+                                    L -> L
+                                end,
+                            Leases < FbCount
+                    end
             end
     end.
 

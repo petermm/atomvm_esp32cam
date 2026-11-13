@@ -2218,6 +2218,30 @@ static term nif_esp32cam_get_psram_mode(Context *ctx, int argc, term argv[])
     return result;
 }
 
+static term nif_esp32cam_available_frames_locked(Context *ctx, int argc, term argv[])
+{
+    UNUSED(ctx);
+    UNUSED(argc);
+    UNUSED(argv);
+    if (!camera_initialized || outstanding_leases >= configured_fb_count) {
+        return FALSE_ATOM;
+    }
+
+    return esp_camera_available_frames() ? TRUE_ATOM : FALSE_ATOM;
+}
+
+static term nif_esp32cam_available_frames(Context *ctx, int argc, term argv[])
+{
+    if (UNLIKELY(!camera_resources_ready)) {
+        RAISE_ERROR(MEMORY_ATOM);
+    }
+
+    LOCK();
+    term result = nif_esp32cam_available_frames_locked(ctx, argc, argv);
+    UNLOCK();
+    return result;
+}
+
 static term pixformat_to_term(pixformat_t format, Context *ctx)
 {
     switch (format) {
@@ -2596,6 +2620,10 @@ static const struct Nif esp32cam_get_psram_mode_nif = {
     .base.type = NIFFunctionType,
     .nif_ptr = nif_esp32cam_get_psram_mode
 };
+static const struct Nif esp32cam_available_frames_nif = {
+    .base.type = NIFFunctionType,
+    .nif_ptr = nif_esp32cam_available_frames
+};
 // When CONFIG_CAMERA_AF_SUPPORT=n the real AF implementations are compiled out, so the
 // af_*_nif entry points fall back to the shared nif_esp32cam_af_unsupported stub.
 #if defined(CONFIG_CAMERA_AF_SUPPORT) && CONFIG_CAMERA_AF_SUPPORT
@@ -2699,6 +2727,10 @@ const struct Nif *atomvm_esp32cam_get_nif(const char *nifname)
     if (strcmp("esp32cam:get_psram_mode_nif/0", nifname) == 0) {
         TRACE("Resolved platform nif %s ...\n", nifname);
         return &esp32cam_get_psram_mode_nif;
+    }
+    if (strcmp("esp32cam:available_frames_nif/0", nifname) == 0) {
+        TRACE("Resolved platform nif %s ...\n", nifname);
+        return &esp32cam_available_frames_nif;
     }
     if (strcmp("esp32cam:af_init_nif/1", nifname) == 0) {
         TRACE("Resolved platform nif %s ...\n", nifname);

@@ -42,6 +42,8 @@
     set_psram_mode_nif/1,
     get_psram_mode/0,
     get_psram_mode_nif/0,
+    available_frames/0,
+    available_frames_nif/0,
     resolve_fb_count/2,
     af_init/1,
     af_init_nif/1,
@@ -739,6 +741,18 @@ get_psram_mode() ->
     esp32cam:get_psram_mode_nif().
 
 get_psram_mode_nif() ->
+    throw(nif_error).
+
+%%-----------------------------------------------------------------------------
+%% @returns `true' if a frame is ready in the driver queue, `false' otherwise.
+%% @doc     Check whether a frame is available in the driver queue without blocking.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec available_frames() -> boolean().
+available_frames() ->
+    esp32cam:available_frames_nif().
+
+available_frames_nif() ->
     throw(nif_error).
 
 %%-----------------------------------------------------------------------------

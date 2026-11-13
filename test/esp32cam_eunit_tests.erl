@@ -64,7 +64,8 @@ esp32cam_test_() ->
                 fun test_view_active_release_rejection/0,
                 fun test_lease_limits/0,
                 fun test_reinit_lease_rejection/0,
-                fun test_destructor_returns_fb/0
+                fun test_destructor_returns_fb/0,
+                test_available_frames()
             ]},
             {"PSRAM and Framebuffer Auto-Resolution Tests", [
                 fun test_psram_size/0,
@@ -626,6 +627,31 @@ test_destructor_returns_fb() ->
         % Now capture should succeed
         {ok, Frame2} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
         ok = safe_call(fun() -> esp32cam_mock:release_frame(Frame2) end)
+    end).
+
+test_available_frames() ->
+    ?_test(begin
+        % 1. Before init, available_frames returns false
+        erase(esp32cam_current_board),
+        ?assertEqual(false, esp32cam_mock:available_frames()),
+
+        % 2. After init with fb_count=1, frame is available
+        ok = safe_call(fun() -> esp32cam_mock:init([{fb_count, 1}]) end),
+        ?assertEqual(true, esp32cam_mock:available_frames()),
+
+        % 3. While the single framebuffer is leased, available_frames is false
+        {ok, Frame} = safe_call(fun() -> esp32cam_mock:capture_frame() end),
+        ?assertEqual(false, esp32cam_mock:available_frames()),
+
+        % 4. After releasing the frame, available_frames is true again
+        ok = safe_call(fun() -> esp32cam_mock:release_frame(Frame) end),
+        ?assertEqual(true, esp32cam_mock:available_frames()),
+
+        % 5. Explicit mock override and reset on re-init
+        put(esp32cam_mock_available_frames, false),
+        ?assertEqual(false, esp32cam_mock:available_frames()),
+        ok = safe_call(fun() -> esp32cam_mock:init() end),
+        ?assertEqual(true, esp32cam_mock:available_frames())
     end).
 
 test_psram_size() ->

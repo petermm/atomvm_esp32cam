@@ -12,7 +12,7 @@ This driver runs as a native ESP-IDF component compiled directly into the AtomVM
 ## Key Features
 
 * **15 Predefined Boards + Custom Pinouts**: Out-of-the-box support for popular ESP32 and ESP32-S3 boards (including AI-Thinker, WROVER-KIT, ESP32-S3 WROOM/XIAO/GOOUUU, M5Cam, LilyGO T-Camera, and ESP-EYE), arbitrary `{board, custom}` GPIO pinouts, and runtime detection via `camera_scanner`.
-* **Standard & Zero-Copy Frame Capture**: Capture reference-counted Erlang binaries (`capture/0,1`) or lease PSRAM/driver framebuffers directly with zero extra copies (`capture_frame/0,1`, `frame_binary/1`, `frame_info/1`, `release_frame/1`).
+* **Standard & Zero-Copy Frame Capture**: Capture reference-counted Erlang binaries (`capture/0,1`) or lease PSRAM/driver framebuffers directly with zero extra copies (`capture_frame/0,1`, `frame_binary/1`, `frame_info/1`, `release_frame/1`) and non-blocking readiness checks (`available_frames/0`).
 * **Up to 5MP Resolution & 10 Pixel Formats**: Capture from `96x96` up to `'5mp'` (`2592x1944`) across `jpeg`, `rgb565`, `grayscale`, `yuv422`, `yuv420`, `rgb888`, `raw`, `rgb444`, `rgb555`, and `raw8`.
 * **Runtime Sensor Controls & PSRAM DMA**: Adjust live controls (`brightness`, `contrast`, `saturation`, `hmirror`, `vflip`, `wb_mode`, `auto_white_balance`, `awb_gain`) without restarting the camera, and toggle PSRAM DMA mode (`set_psram_mode/1`).
 * **Flash LED & Warm-Up Calibration**: Built-in board flash control with pre-shot exposure delay (`{flash, on}`, `{flash_delay_ms, Ms}`) and C-level `warm_up_frames` discarding.
@@ -66,16 +66,22 @@ ok = esp32cam:init(Config),
 For streaming or memory-constrained loops, `capture_frame/0,1` leases the driver framebuffer without copying it into a new Erlang heap binary. Always call `release_frame/1` once you are done reading `frame_binary/1`:
 
 ```erlang
-{ok, Frame} = esp32cam:capture_frame(),
-{ok, Info} = esp32cam:frame_info(Frame),
-io:format("Frame ~px~p (~p)~n", [
-    maps:get(width, Info),
-    maps:get(height, Info),
-    maps:get(format, Info)
-]),
-% Display directly from the leased framebuffer or read its binary view
-ok = term_image:display(Frame),
-ok = esp32cam:release_frame(Frame).
+% Optional non-blocking readiness check
+case esp32cam:available_frames() of
+    true ->
+        {ok, Frame} = esp32cam:capture_frame(),
+        {ok, Info} = esp32cam:frame_info(Frame),
+        io:format("Frame ~px~p (~p)~n", [
+            maps:get(width, Info),
+            maps:get(height, Info),
+            maps:get(format, Info)
+        ]),
+        % Display directly from the leased framebuffer or read its binary view
+        ok = term_image:display(Frame),
+        ok = esp32cam:release_frame(Frame);
+    false ->
+        ok
+end.
 ```
 
 > **Note**: While any zero-copy view from `frame_binary/1` is still referenced by live Erlang terms, `release_frame/1` prevents premature buffer return; let references go out of scope (or trigger GC) before releasing.
@@ -133,7 +139,7 @@ callback is unimplemented: `af_set_manual_position/1` returns `{error, -1}` (`ES
 |---|---|
 | **Lifecycle & Info** | `esp32cam:init/0,1`, `esp32cam:get_board_info/0`, `esp32cam:has_flash/0,1`, `esp32cam:psram_size/0` |
 | **Standard Capture** | `esp32cam:capture/0,1`, `esp32cam:capture_with_flash/1,2` |
-| **Zero-Copy Capture** | `esp32cam:capture_frame/0,1`, `esp32cam:frame_binary/1`, `esp32cam:frame_info/1`, `esp32cam:release_frame/1` |
+| **Zero-Copy Capture** | `esp32cam:capture_frame/0,1`, `esp32cam:frame_binary/1`, `esp32cam:frame_info/1`, `esp32cam:release_frame/1`, `esp32cam:available_frames/0` |
 | **Controls & DMA** | `esp32cam:set_control/2`, `esp32cam:set_psram_mode/1`, `esp32cam:get_psram_mode/0` |
 | **Autofocus (OV5640)** | `esp32cam:af_init/1`, `esp32cam:af_set_mode/1`, `esp32cam:af_trigger/0`, `esp32cam:af_get_status/0`, `esp32cam:af_wait/1`, `esp32cam:af_set_manual_position/1` |
 | **Utilities** | `camera_scanner:scan/0,1`, `term_image:display/1` |
